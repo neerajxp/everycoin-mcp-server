@@ -1,12 +1,14 @@
 """
 EveryCoin MCP Server — HTTP transport
-Demonstrates agentic AI tool use via the Model Context Protocol.
+Provides:
+  POST /api/chat   — Anthropic Claude proxy (replaces chat.php)
+  POST /mcp        — MCP JSON-RPC endpoint
+  GET  /health     — Health check
 
 Start locally:  python server.py
 Railway:        auto-starts via Procfile
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -227,6 +229,84 @@ def _search_knowledge(query: str) -> list[types.TextContent]:
     return [types.TextContent(type="text", text="\n\n".join(matches))]
 
 
+# ── Chat proxy (replaces chat.php) ────────────────────────────────────────────
+
+SYSTEM_PROMPT = (
+    "You are the EveryCoin Agent — a sharp, concise blockchain and crypto expert on everycoin.ai. "
+    "You specialize in:\n"
+    "- DeFi protocols (Uniswap, Aave, Curve, GMX, Pendle, etc.)\n"
+    "- On-chain analysis, whale tracking, wallet forensics\n"
+    "- Smart contract security & rug pull detection\n"
+    "- Tokenomics & project evaluation frameworks\n"
+    "- L2 scaling (Arbitrum, Optimism, Base, zkSync)\n"
+    "- NFTs, digital assets, and ordinals\n"
+    "- Portfolio strategy, risk management, position sizing\n"
+    "- MEV, gas optimization, bridge security\n"
+    "- Global crypto regulatory landscape\n\n"
+    "Communication style:\n"
+    "- Lead with the key point — be concise and sharp\n"
+    "- Use **bold** for key terms, tickers, and protocols\n"
+    "- Bullet points for lists of risks, options, or steps\n"
+    "- Prefix alerts with ⚠\n"
+    "- Use code style for metrics and percentages\n"
+    "- Never pad with filler. Be the expert in the room.\n"
+    "- Remind users to DYOR on high-stakes decisions."
+)
+
+
+async def handle_chat(request: Request) -> JSONResponse:
+    cors_headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+    }
+
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=cors_headers)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400, headers=cors_headers)
+
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return JSONResponse({"error": "Invalid request: messages array required."}, status_code=400, headers=cors_headers)
+
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        log.error("ANTHROPIC_API_KEY is not set")
+        return JSONResponse({"error": "Server configuration error"}, status_code=500, headers=cors_headers)
+
+    async with httpx.AsyncClient() as client:
+        try:
+            res = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 1024,
+                    "system": SYSTEM_PROMPT,
+                    "messages": messages,
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                timeout=30,
+            )
+            data = res.json()
+        except Exception as e:
+            log.exception("Anthropic request failed")
+            return JSONResponse({"error": str(e)}, status_code=502, headers=cors_headers)
+
+    if "error" in data:
+        return JSONResponse({"error": data["error"].get("message", "Anthropic API error")}, status_code=502, headers=cors_headers)
+
+    text = data.get("content", [{}])[0].get("text", "No response generated.")
+    return JSONResponse({"content": text}, headers=cors_headers)
+
+
 # ── HTTP handler (JSON-RPC over POST /mcp) ─────────────────────────────────────
 
 async def handle_mcp(request: Request) -> JSONResponse:
@@ -279,13 +359,14 @@ async def handle_mcp(request: Request) -> JSONResponse:
 
 
 async def handle_health(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok", "server": "everycoin-mcp", "tools": 4})
+    return JSONResponse({"status": "ok", "server": "everycoin-mcp", "tools": 4, "endpoints": ["/api/chat", "/mcp"]})
 
 
 # ── Starlette app ──────────────────────────────────────────────────────────────
 
 starlette_app = Starlette(
     routes=[
+        Route("/api/chat", handle_chat, methods=["POST", "OPTIONS"]),
         Route("/mcp", handle_mcp, methods=["POST"]),
         Route("/health", handle_health, methods=["GET"]),
     ]
