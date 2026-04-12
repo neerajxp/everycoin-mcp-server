@@ -102,6 +102,11 @@ def _extract_wallets(text: str) -> list[str]:
 
 # ── AgentState ────────────────────────────────────────────────────────────────
 
+def _merge_tool_results(a: dict, b: dict) -> dict:
+    """Reducer: merge concurrent agent writes into tool_results."""
+    return {**a, **b}
+
+
 class AgentState(TypedDict):
     # conversation
     messages: Annotated[list, add_messages]   # short-term: full chat history
@@ -117,8 +122,8 @@ class AgentState(TypedDict):
     query_type: str                           # set by router node
     active_agents: list[str]                  # which nodes to run
 
-    # inter-node results (written by each agent, read by strategist)
-    tool_results: dict[str, Any]
+    # inter-node results — Annotated reducer handles parallel agent writes
+    tool_results: Annotated[dict[str, Any], _merge_tool_results]
 
     # output
     final_answer: str
