@@ -11,7 +11,7 @@ from pathlib import Path
 
 import chromadb
 from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 log = logging.getLogger("everycoin.rag")
 
@@ -23,14 +23,14 @@ COLLECTION_NAME = "everycoin_knowledge"
 
 _client: chromadb.ClientAPI | None = None
 _collection: chromadb.Collection | None = None
-_model: SentenceTransformer | None = None
+_model: TextEmbedding | None = None
 
 
-def _get_model() -> SentenceTransformer:
+def _get_model() -> TextEmbedding:
     global _model
     if _model is None:
-        log.info("Loading sentence-transformers model...")
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
+        log.info("Loading fastembed model...")
+        _model = TextEmbedding("BAAI/bge-small-en-v1.5")
         log.info("Model loaded.")
     return _model
 
@@ -109,7 +109,7 @@ def init_rag() -> None:
     metadatas = [c["metadata"] for c in all_chunks]
 
     log.info("RAG: embedding %d chunks...", len(texts))
-    embeddings = model.encode(texts, show_progress_bar=False).tolist()
+    embeddings = list(model.embed(texts))
 
     _collection.add(documents=texts, embeddings=embeddings, ids=ids, metadatas=metadatas)
     log.info("RAG: indexed %d chunks into ChromaDB", len(texts))
@@ -124,7 +124,7 @@ def search(query: str, topic: str | None = None, n_results: int = 3) -> list[dic
         return [{"text": "RAG not initialized.", "source": "", "topic": ""}]
 
     model = _get_model()
-    query_embedding = model.encode([query], show_progress_bar=False).tolist()
+    query_embedding = list(model.embed([query]))
 
     where = {"topic": topic} if topic else None
 
