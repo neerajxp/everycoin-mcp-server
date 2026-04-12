@@ -188,7 +188,7 @@ def router(state: AgentState) -> dict:
         history_text = "\n".join(f"{m['role']}: {m['content']}" for m in recent)
         history_text = f"\nRecent conversation:\n{history_text}\n"
 
-    llm = _llm_fast()
+    llm = _llm_fast()  # Haiku: cheap + fast — routing is classification only, no quality needed
     response = llm.invoke([
         SystemMessage(content=_ROUTER_SYSTEM),
         HumanMessage(content=f"{history_text}Current query: {query}"),
@@ -238,7 +238,7 @@ async def market_analyst(state: AgentState) -> dict:
     gas_data = await mcp_tools.get_gas_price()
     gathered["gas"] = gas_data
 
-    # Summarize with LLM
+    # Haiku: summarizes raw API data into bullet points — speed over quality
     llm = _llm_fast()
     response = llm.invoke([
         SystemMessage(content=_MARKET_SYSTEM),
@@ -279,7 +279,7 @@ async def defi_researcher(state: AgentState) -> dict:
         stats = await mcp_tools.get_defi_stats(protocol)
         gathered[protocol] = stats
 
-    llm = _llm_fast()
+    llm = _llm_fast()  # Haiku: converts raw DeFi API data to readable summary — no deep reasoning needed
     response = llm.invoke([
         SystemMessage(content=_DEFI_SYSTEM),
         HumanMessage(content=f"Query: {query}\nProtocol data: {json.dumps(gathered)}"),
@@ -318,7 +318,7 @@ async def wallet_forensics(state: AgentState) -> dict:
         data = await mcp_tools.analyze_wallet(addr)
         gathered[addr] = data
 
-    llm = _llm_fast()
+    llm = _llm_fast()  # Haiku: pattern-matching on wallet data — fast structured output
     response = llm.invoke([
         SystemMessage(content=_WALLET_SYSTEM),
         HumanMessage(content=f"Query: {query}\nWallet data: {json.dumps(gathered)}"),
@@ -373,7 +373,7 @@ def knowledge_expert(state: AgentState) -> dict:
 
     context = "\n\n".join(f"[{c['source']}]\n{c['text']}" for c in chunks)
 
-    llm = _llm_fast()
+    llm = _llm_fast()  # Haiku: distills RAG chunks into key points — retrieval summary, not final answer
     response = llm.invoke([
         SystemMessage(content=_KNOWLEDGE_SYSTEM),
         HumanMessage(content=f"Query: {query}\n\nRetrieved knowledge:\n{context}"),
@@ -429,7 +429,7 @@ def strategist(state: AgentState) -> dict:
         f"Watched wallets: {len(user_profile.get('wallets_watched', []))} saved"
     )
 
-    llm = _llm()
+    llm = _llm()  # Sonnet: final synthesis — personalizes answer using all agent outputs + user profile
     response = llm.invoke([
         SystemMessage(content=_STRATEGIST_SYSTEM),
         HumanMessage(content=(
