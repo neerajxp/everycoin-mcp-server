@@ -34,8 +34,20 @@ import mcp_tools
 log = logging.getLogger("everycoin.graph")
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
+# Haiku  — router + intermediate agents (fast, cheap, low token usage)
+# Sonnet — strategist only (final synthesis, highest quality)
+
+def _llm_fast() -> ChatAnthropic:
+    """Haiku — used for routing and per-agent summarization."""
+    return ChatAnthropic(
+        model="claude-haiku-4-5-20251001",
+        api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+        max_tokens=512,
+    )
+
 
 def _llm() -> ChatAnthropic:
+    """Sonnet — used only for final strategist synthesis."""
     return ChatAnthropic(
         model="claude-sonnet-4-6",
         api_key=os.getenv("ANTHROPIC_API_KEY", ""),
@@ -176,7 +188,7 @@ def router(state: AgentState) -> dict:
         history_text = "\n".join(f"{m['role']}: {m['content']}" for m in recent)
         history_text = f"\nRecent conversation:\n{history_text}\n"
 
-    llm = _llm()
+    llm = _llm_fast()
     response = llm.invoke([
         SystemMessage(content=_ROUTER_SYSTEM),
         HumanMessage(content=f"{history_text}Current query: {query}"),
@@ -227,7 +239,7 @@ async def market_analyst(state: AgentState) -> dict:
     gathered["gas"] = gas_data
 
     # Summarize with LLM
-    llm = _llm()
+    llm = _llm_fast()
     response = llm.invoke([
         SystemMessage(content=_MARKET_SYSTEM),
         HumanMessage(content=f"Query: {query}\nTool data: {json.dumps(gathered)}"),
@@ -267,7 +279,7 @@ async def defi_researcher(state: AgentState) -> dict:
         stats = await mcp_tools.get_defi_stats(protocol)
         gathered[protocol] = stats
 
-    llm = _llm()
+    llm = _llm_fast()
     response = llm.invoke([
         SystemMessage(content=_DEFI_SYSTEM),
         HumanMessage(content=f"Query: {query}\nProtocol data: {json.dumps(gathered)}"),
@@ -306,7 +318,7 @@ async def wallet_forensics(state: AgentState) -> dict:
         data = await mcp_tools.analyze_wallet(addr)
         gathered[addr] = data
 
-    llm = _llm()
+    llm = _llm_fast()
     response = llm.invoke([
         SystemMessage(content=_WALLET_SYSTEM),
         HumanMessage(content=f"Query: {query}\nWallet data: {json.dumps(gathered)}"),
@@ -361,7 +373,7 @@ def knowledge_expert(state: AgentState) -> dict:
 
     context = "\n\n".join(f"[{c['source']}]\n{c['text']}" for c in chunks)
 
-    llm = _llm()
+    llm = _llm_fast()
     response = llm.invoke([
         SystemMessage(content=_KNOWLEDGE_SYSTEM),
         HumanMessage(content=f"Query: {query}\n\nRetrieved knowledge:\n{context}"),
