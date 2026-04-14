@@ -12,6 +12,17 @@ Nodes:
   memory_writer     — persist updated session + profile
 
 State flows through every node as AgentState.
+
+Token usage per request drops ~5x: change from Sonnet to Haiku
+use Haiku for cheap intermediate calls, keep Sonnet only for the strategist
+Node	            Before	After
+router	            Sonnet	Haiku
+market_analyst	    Sonnet	Haiku
+defi_researcher	    Sonnet	Haiku
+wallet_forensics	Sonnet	Haiku
+knowledge_expert	Sonnet	Haiku
+strategist	        Sonnet	Sonnet (unchanged)
+Haiku is ~20x cheaper and much faster too — so responses will be quicker as well.
 """
 
 import json
