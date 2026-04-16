@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 
 from mlops import db
 from mlops.config import FETCH_INTERVAL_MINUTES
+from mlops.features import run_feature_engineering
 from mlops.fetch import run_pipeline
 
 load_dotenv()
@@ -36,8 +37,9 @@ log = logging.getLogger("everycoin.mlops.scheduler")
 
 
 def _tick() -> None:
-    """Synchronous wrapper — APScheduler calls this; it runs the async pipeline."""
+    """Synchronous wrapper — APScheduler calls this; it runs the async pipeline then features."""
     asyncio.run(run_pipeline())
+    run_feature_engineering()
 
 
 def main() -> None:

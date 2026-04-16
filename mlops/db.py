@@ -5,6 +5,7 @@ Tables:
   price_history  — hourly price snapshots per coin
   gas_history    — hourly Ethereum gas snapshots
   defi_history   — hourly DeFi protocol TVL snapshots
+  feature_store  — engineered features per coin per timestamp
 """
 
 import sqlite3
@@ -57,6 +58,33 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_defi_protocol
                 ON defi_history (protocol, fetched_at);
+
+            CREATE TABLE IF NOT EXISTS feature_store (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                computed_at     TEXT    NOT NULL,
+                coin_id         TEXT    NOT NULL,
+                price_usd       REAL,
+                return_1h       REAL,
+                return_6h       REAL,
+                return_24h      REAL,
+                sma_7           REAL,
+                sma_24          REAL,
+                ema_12          REAL,
+                ema_26          REAL,
+                macd            REAL,
+                macd_signal     REAL,
+                macd_hist       REAL,
+                rsi_14          REAL,
+                bb_upper        REAL,
+                bb_middle       REAL,
+                bb_lower        REAL,
+                bb_width        REAL,
+                volatility_24h  REAL,
+                market_cap      REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_feature_coin
+                ON feature_store (coin_id, computed_at);
         """)
     log.info("DB ready: %s", DB_PATH)
 
@@ -127,12 +155,57 @@ def price_history(coin_id: str, limit: int = 168) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def insert_features(coin_id: str, features: dict) -> None:
+    ts = _now()
+    with _conn() as conn:
+        conn.execute("""
+            INSERT INTO feature_store (
+                computed_at, coin_id, price_usd,
+                return_1h, return_6h, return_24h,
+                sma_7, sma_24, ema_12, ema_26,
+                macd, macd_signal, macd_hist,
+                rsi_14, bb_upper, bb_middle, bb_lower, bb_width,
+                volatility_24h, market_cap
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            ts, coin_id, features.get("price_usd"),
+            features.get("return_1h"), features.get("return_6h"), features.get("return_24h"),
+            features.get("sma_7"), features.get("sma_24"),
+            features.get("ema_12"), features.get("ema_26"),
+            features.get("macd"), features.get("macd_signal"), features.get("macd_hist"),
+            features.get("rsi_14"),
+            features.get("bb_upper"), features.get("bb_middle"), features.get("bb_lower"), features.get("bb_width"),
+            features.get("volatility_24h"), features.get("market_cap"),
+        ))
+
+
+def latest_features(coin_id: str | None = None) -> list[dict]:
+    """Return the most recent feature row per coin (or for one specific coin)."""
+    with _conn() as conn:
+        if coin_id:
+            rows = conn.execute(
+                "SELECT * FROM feature_store WHERE coin_id=? ORDER BY computed_at DESC LIMIT 1",
+                (coin_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT f.* FROM feature_store f
+                INNER JOIN (
+                    SELECT coin_id, MAX(computed_at) AS latest
+                    FROM feature_store GROUP BY coin_id
+                ) m ON f.coin_id = m.coin_id AND f.computed_at = m.latest
+                ORDER BY f.coin_id
+            """).fetchall()
+    return [dict(r) for r in rows]
+
+
 def row_counts() -> dict[str, int]:
     with _conn() as conn:
         return {
             "price_history": conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0],
             "gas_history":   conn.execute("SELECT COUNT(*) FROM gas_history").fetchone()[0],
             "defi_history":  conn.execute("SELECT COUNT(*) FROM defi_history").fetchone()[0],
+            "feature_store": conn.execute("SELECT COUNT(*) FROM feature_store").fetchone()[0],
         }
 
 
