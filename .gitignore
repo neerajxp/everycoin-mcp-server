@@ -7,3 +7,5 @@ venv/
 chroma_db/
 user_profiles/*.json
 mlops/data/
+mlruns/
+mlflow.db

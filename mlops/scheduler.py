@@ -1,15 +1,15 @@
 """
 MLOps pipeline scheduler.
 
+Jobs:
+  Hourly  — fetch market data + compute features
+  Weekly  — retrain XGBoost model (every Sunday 02:00 UTC)
+
 Usage:
-  # Run once immediately (useful for testing):
-  python -m mlops.scheduler --once
-
-  # Run continuously on a schedule (default: every 60 min):
-  python -m mlops.scheduler
-
-  # Custom interval:
-  python -m mlops.scheduler --interval 30
+  python -m mlops.scheduler              # run both jobs on schedule
+  python -m mlops.scheduler --once       # run fetch+features once then exit
+  python -m mlops.scheduler --retrain    # run retrain once then exit
+  python -m mlops.scheduler --interval 30  # custom fetch interval (minutes)
 """
 
 import argparse
@@ -24,6 +24,7 @@ from mlops import db
 from mlops.config import FETCH_INTERVAL_MINUTES
 from mlops.features import run_feature_engineering
 from mlops.fetch import run_pipeline
+from mlops.train import train as run_train
 
 load_dotenv()
 
@@ -37,33 +38,71 @@ log = logging.getLogger("everycoin.mlops.scheduler")
 
 
 def _tick() -> None:
-    """Synchronous wrapper — APScheduler calls this; it runs the async pipeline then features."""
+    """Hourly: fetch data + compute features."""
     asyncio.run(run_pipeline())
     run_feature_engineering()
 
 
+def _weekly_retrain() -> None:
+    """Weekly: retrain XGBoost on latest feature_store data and log to MLflow."""
+    log.info("=== Weekly retrain triggered ===")
+    try:
+        metrics = run_train()
+        log.info("=== Weekly retrain complete | roc_auc=%.4f accuracy=%.4f ===",
+                 metrics.get("roc_auc", 0), metrics.get("accuracy", 0))
+    except Exception as e:
+        log.error("=== Weekly retrain FAILED: %s ===", e)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="EveryCoin MLOps data pipeline")
-    parser.add_argument("--once", action="store_true", help="Run pipeline once then exit")
+    parser = argparse.ArgumentParser(description="EveryCoin MLOps scheduler")
+    parser.add_argument("--once",     action="store_true", help="Run fetch+features once then exit")
+    parser.add_argument("--retrain",  action="store_true", help="Run retrain once then exit")
     parser.add_argument("--interval", type=int, default=FETCH_INTERVAL_MINUTES, help="Fetch interval in minutes")
     args = parser.parse_args()
 
     db.init_db()
 
+    # ── One-shot modes ────────────────────────────────────────────────────────
     if args.once:
-        log.info("Running pipeline once ...")
+        log.info("Running fetch + features once ...")
         _tick()
-        counts = db.row_counts()
-        log.info("Done. DB row counts: %s", counts)
+        log.info("Done. DB: %s", db.row_counts())
         return
 
-    log.info("Starting scheduler — interval: %d min", args.interval)
+    if args.retrain:
+        log.info("Running retrain once ...")
+        _weekly_retrain()
+        return
+
+    # ── Continuous scheduled mode ─────────────────────────────────────────────
+    log.info("Starting scheduler")
+    log.info("  Hourly fetch  : every %d min", args.interval)
+    log.info("  Weekly retrain: every Sunday 02:00 UTC")
+
     _tick()  # run immediately on startup
 
     scheduler = BlockingScheduler(timezone="UTC")
-    scheduler.add_job(_tick, "interval", minutes=args.interval, id="pipeline")
-    log.info("Next run in %d minutes. Press Ctrl+C to stop.", args.interval)
 
+    # Hourly fetch + features
+    scheduler.add_job(
+        _tick,
+        "interval",
+        minutes=args.interval,
+        id="hourly_pipeline",
+    )
+
+    # Weekly retrain — every Sunday at 02:00 UTC
+    scheduler.add_job(
+        _weekly_retrain,
+        "cron",
+        day_of_week="sun",
+        hour=2,
+        minute=0,
+        id="weekly_retrain",
+    )
+
+    log.info("Scheduler running. Press Ctrl+C to stop.")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

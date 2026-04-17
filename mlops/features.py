@@ -1,10 +1,11 @@
 """
-Week 2 — Feature Engineering.
+Feature Engineering — computes technical indicators for all historical rows.
 
-Reads price_history from SQLite, computes technical indicators using pandas,
-and writes the result to feature_store.
+Two modes:
+  run_feature_engineering()       — incremental: only new rows since last compute
+  run_feature_engineering_full()  — full rebuild: recomputes all rows (used after backfill)
 
-Features computed per coin:
+Features per row:
   Returns     : 1h, 6h, 24h price returns
   SMA         : 7-period, 24-period simple moving average
   EMA         : 12-period, 26-period exponential moving average
@@ -15,149 +16,196 @@ Features computed per coin:
 """
 
 import logging
+import sqlite3
+
 import pandas as pd
 
 from mlops import db
-from mlops.config import COINS
+from mlops.config import COINS, DB_PATH
 
 log = logging.getLogger("everycoin.mlops.features")
 
 
-# ── Main entry point ─────────────────────────────────────────────────────────
+# ── Public entry points ───────────────────────────────────────────────────────
 
 def run_feature_engineering() -> dict[str, int]:
-    """Compute and store features for all coins. Returns count of rows written."""
-    log.info("=== Feature engineering started ===")
+    """Incremental: compute features only for the latest tick (live pipeline use)."""
+    log.info("=== Feature engineering (incremental) ===")
     written = 0
     for coin_id in COINS:
         rows = db.price_history(coin_id, limit=200)
         if len(rows) < 2:
             log.warning("  skip %s — not enough data (%d rows)", coin_id, len(rows))
             continue
-
-        features = _compute_features(coin_id, rows)
-        if features:
-            db.insert_features(coin_id, features)
+        df = _build_df(rows)
+        row = _row_to_dict(df, coin_id, -1)
+        if row:
+            db.insert_features(coin_id, row)
             written += 1
-            log.info(
-                "  ✓ %s | price=$%.2f rsi=%.1f macd=%.4f return_1h=%.2f%%",
-                coin_id,
-                features.get("price_usd") or 0,
-                features.get("rsi_14") or 0,
-                features.get("macd") or 0,
-                (features.get("return_1h") or 0) * 100,
-            )
-
-    log.info("=== Feature engineering done — %d coins processed ===", written)
+            _log_row(row)
+    log.info("=== done — %d coins written ===", written)
     return {"coins_processed": written}
 
 
-# ── Core computation ──────────────────────────────────────────────────────────
-
-def _compute_features(coin_id: str, rows: list[dict]) -> dict | None:
-    # rows come back DESC from db — reverse to get chronological order
-    df = pd.DataFrame(rows).sort_values("fetched_at").reset_index(drop=True)
-    df["price_usd"] = pd.to_numeric(df["price_usd"], errors="coerce")
-    df = df.dropna(subset=["price_usd"])
-
-    if len(df) < 2:
-        return None
-
-    price = df["price_usd"]
-    n = len(price)
-
-    features: dict = {
-        "price_usd":  _last(price),
-        "market_cap": _last(pd.to_numeric(df["market_cap"], errors="coerce")),
-    }
-
-    # ── Returns ───────────────────────────────────────────────────────────────
-    features["return_1h"]  = _pct_change(price, 1)
-    features["return_6h"]  = _pct_change(price, 6)
-    features["return_24h"] = _pct_change(price, 24)
-
-    # ── SMA ───────────────────────────────────────────────────────────────────
-    features["sma_7"]  = _sma(price, min(7, n))
-    features["sma_24"] = _sma(price, min(24, n))
-
-    # ── EMA ───────────────────────────────────────────────────────────────────
-    features["ema_12"] = _ema(price, min(12, n))
-    features["ema_26"] = _ema(price, min(26, n))
-
-    # ── MACD ──────────────────────────────────────────────────────────────────
-    ema12 = price.ewm(span=min(12, n), adjust=False).mean()
-    ema26 = price.ewm(span=min(26, n), adjust=False).mean()
-    macd_line = ema12 - ema26
-    signal    = macd_line.ewm(span=min(9, n), adjust=False).mean()
-    features["macd"]        = _last(macd_line)
-    features["macd_signal"] = _last(signal)
-    features["macd_hist"]   = _r(_last(macd_line) - _last(signal))
-
-    # ── RSI ───────────────────────────────────────────────────────────────────
-    features["rsi_14"] = _rsi(price, min(14, n))
-
-    # ── Bollinger Bands ───────────────────────────────────────────────────────
-    window = min(20, n)
-    bb_mid   = price.rolling(window).mean()
-    bb_std   = price.rolling(window).std()
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
-    mid_val  = _last(bb_mid)
-    up_val   = _last(bb_upper)
-    lo_val   = _last(bb_lower)
-    features["bb_upper"]  = up_val
-    features["bb_middle"] = mid_val
-    features["bb_lower"]  = lo_val
-    features["bb_width"]  = _r((up_val - lo_val) / mid_val) if mid_val else None
-
-    # ── Volatility ────────────────────────────────────────────────────────────
-    returns = price.pct_change()
-    features["volatility_24h"] = _r(returns.rolling(min(24, n)).std().iloc[-1])
-
-    return features
+def run_feature_engineering_full() -> dict[str, int]:
+    """Full rebuild: compute features for every historical row per coin.
+    Clears feature_store first, then recomputes from all price_history rows.
+    Use this after a backfill."""
+    log.info("=== Feature engineering FULL REBUILD ===")
+    _clear_feature_store()
+    total = 0
+    for coin_id in COINS:
+        rows = db.price_history(coin_id, limit=10000)
+        if len(rows) < 14:
+            log.warning("  skip %s — only %d rows", coin_id, len(rows))
+            continue
+        df    = _build_df(rows)
+        count = _insert_all_rows(df, coin_id)
+        total += count
+        log.info("  ✓ %-15s %d feature rows written", coin_id, count)
+    log.info("=== Full rebuild done — %d total rows ===", total)
+    return {"total_rows": total}
 
 
-# ── Indicator helpers ─────────────────────────────────────────────────────────
+# ── DataFrame builder ─────────────────────────────────────────────────────────
 
-def _sma(price: pd.Series, window: int) -> float | None:
-    val = price.rolling(window).mean().iloc[-1]
-    return _r(val)
+def _build_df(rows: list[dict]) -> pd.DataFrame:
+    """Build chronological price DataFrame with all indicators computed."""
+    df = (
+        pd.DataFrame(rows)
+        .sort_values("fetched_at")
+        .reset_index(drop=True)
+    )
+    df["price_usd"]  = pd.to_numeric(df["price_usd"],  errors="coerce")
+    df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
+    df = df.dropna(subset=["price_usd"]).reset_index(drop=True)
 
+    p = df["price_usd"]
 
-def _ema(price: pd.Series, span: int) -> float | None:
-    val = price.ewm(span=span, adjust=False).mean().iloc[-1]
-    return _r(val)
+    # Returns
+    df["return_1h"]  = p.pct_change(1)
+    df["return_6h"]  = p.pct_change(6)
+    df["return_24h"] = p.pct_change(24)
 
+    # SMA
+    df["sma_7"]  = p.rolling(7).mean()
+    df["sma_24"] = p.rolling(24).mean()
 
-def _rsi(price: pd.Series, window: int) -> float | None:
-    delta = price.diff()
-    gain  = delta.clip(lower=0).rolling(window).mean()
-    loss  = (-delta.clip(upper=0)).rolling(window).mean()
+    # EMA
+    df["ema_12"] = p.ewm(span=12, adjust=False).mean()
+    df["ema_26"] = p.ewm(span=26, adjust=False).mean()
+
+    # MACD
+    macd_line       = df["ema_12"] - df["ema_26"]
+    signal          = macd_line.ewm(span=9, adjust=False).mean()
+    df["macd"]       = macd_line
+    df["macd_signal"] = signal
+    df["macd_hist"]  = macd_line - signal
+
+    # RSI (14)
+    delta = p.diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
     rs    = gain / loss.replace(0, float("nan"))
-    rsi   = 100 - (100 / (1 + rs))
-    val   = rsi.iloc[-1]
-    return _r(val)
+    df["rsi_14"] = 100 - (100 / (1 + rs))
+
+    # Bollinger Bands (20)
+    bb_mid        = p.rolling(20).mean()
+    bb_std        = p.rolling(20).std()
+    df["bb_upper"]  = bb_mid + 2 * bb_std
+    df["bb_middle"] = bb_mid
+    df["bb_lower"]  = bb_mid - 2 * bb_std
+    df["bb_width"]  = (df["bb_upper"] - df["bb_lower"]) / bb_mid
+
+    # Volatility
+    df["volatility_24h"] = df["return_1h"].rolling(24).std()
+
+    return df
 
 
-def _pct_change(price: pd.Series, periods: int) -> float | None:
-    if len(price) <= periods:
-        return None
-    prev = price.iloc[-(periods + 1)]
-    curr = price.iloc[-1]
-    if prev == 0:
-        return None
-    return _r((curr - prev) / prev)
+# ── Writers ───────────────────────────────────────────────────────────────────
 
-
-def _last(series: pd.Series) -> float | None:
-    val = series.iloc[-1]
-    return _r(val)
-
-
-def _r(val: float | None) -> float | None:
-    """Round to 6 decimal places, return None for NaN/inf."""
+def _insert_all_rows(df: pd.DataFrame, coin_id: str) -> int:
+    """Bulk insert all rows from df into feature_store. Returns count inserted."""
+    feature_cols = [
+        "price_usd", "return_1h", "return_6h", "return_24h",
+        "sma_7", "sma_24", "ema_12", "ema_26",
+        "macd", "macd_signal", "macd_hist",
+        "rsi_14", "bb_upper", "bb_middle", "bb_lower", "bb_width",
+        "volatility_24h", "market_cap",
+    ]
+    # Only keep rows with at least RSI available (needs 14 periods)
+    valid = df.dropna(subset=["rsi_14"])
+    count = 0
+    conn = sqlite3.connect(DB_PATH)
     try:
-        if val is None or pd.isna(val) or not pd.api.types.is_float(val):
+        for _, row in valid.iterrows():
+            features = {col: _r(row.get(col)) for col in feature_cols}
+            features["price_usd"]  = _r(row["price_usd"])
+            features["market_cap"] = _r(row.get("market_cap"))
+            conn.execute("""
+                INSERT INTO feature_store (
+                    computed_at, coin_id, price_usd,
+                    return_1h, return_6h, return_24h,
+                    sma_7, sma_24, ema_12, ema_26,
+                    macd, macd_signal, macd_hist,
+                    rsi_14, bb_upper, bb_middle, bb_lower, bb_width,
+                    volatility_24h, market_cap
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                row["fetched_at"], coin_id, features["price_usd"],
+                features["return_1h"], features["return_6h"], features["return_24h"],
+                features["sma_7"], features["sma_24"],
+                features["ema_12"], features["ema_26"],
+                features["macd"], features["macd_signal"], features["macd_hist"],
+                features["rsi_14"],
+                features["bb_upper"], features["bb_middle"], features["bb_lower"], features["bb_width"],
+                features["volatility_24h"], features["market_cap"],
+            ))
+            count += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return count
+
+
+def _clear_feature_store() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM feature_store")
+    conn.commit()
+    conn.close()
+    log.info("  feature_store cleared")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _row_to_dict(df: pd.DataFrame, coin_id: str, idx: int) -> dict | None:
+    if df.empty:
+        return None
+    row = df.iloc[idx]
+    cols = [
+        "price_usd", "return_1h", "return_6h", "return_24h",
+        "sma_7", "sma_24", "ema_12", "ema_26",
+        "macd", "macd_signal", "macd_hist", "rsi_14",
+        "bb_upper", "bb_middle", "bb_lower", "bb_width",
+        "volatility_24h", "market_cap",
+    ]
+    return {col: _r(row.get(col)) for col in cols}
+
+
+def _log_row(row: dict) -> None:
+    log.info(
+        "  ✓ price=$%.2f rsi=%.1f macd=%.4f return_1h=%.3f%%",
+        row.get("price_usd") or 0,
+        row.get("rsi_14") or 0,
+        row.get("macd") or 0,
+        (row.get("return_1h") or 0) * 100,
+    )
+
+
+def _r(val) -> float | None:
+    try:
+        if val is None or pd.isna(val):
             return None
         return round(float(val), 6)
     except Exception:

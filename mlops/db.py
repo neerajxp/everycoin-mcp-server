@@ -106,13 +106,16 @@ def _conn() -> Generator[sqlite3.Connection, None, None]:
 # ── Writers ───────────────────────────────────────────────────────────────────
 
 def insert_price(coin_id: str, price_usd: float | None, change_24h: float | None, market_cap: float | None) -> None:
-    ts = _now()
+    insert_price_at(_now(), coin_id, price_usd, change_24h, market_cap)
+
+
+def insert_price_at(fetched_at: str, coin_id: str, price_usd: float | None, change_24h: float | None, market_cap: float | None) -> None:
     with _conn() as conn:
         conn.execute(
             "INSERT INTO price_history (fetched_at, coin_id, price_usd, change_24h, market_cap) VALUES (?,?,?,?,?)",
-            (ts, coin_id, price_usd, change_24h, market_cap),
+            (fetched_at, coin_id, price_usd, change_24h, market_cap),
         )
-    log.debug("  ✓ price saved: %s $%.2f", coin_id, price_usd or 0)
+    log.debug("  ✓ price saved: %s $%.2f @ %s", coin_id, price_usd or 0, fetched_at)
 
 
 def insert_gas(slow: float | None, standard: float | None, fast: float | None) -> None:
