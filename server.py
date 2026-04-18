@@ -147,6 +147,9 @@ async def handle_prices(request: Request) -> JSONResponse:
     GET /prices?ids=bitcoin,ethereum,solana
     Returns { coin_id: { price_usd, change_24h_pct } }
     """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS)
+
     ids = request.query_params.get("ids", "")
     if not ids:
         return JSONResponse({"error": "ids param required"}, status_code=400, headers=_CORS)
