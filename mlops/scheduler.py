@@ -21,9 +21,10 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
 
 from mlops import db
-from mlops.config import FETCH_INTERVAL_MINUTES
-from mlops.features import run_feature_engineering
+from mlops.config import FETCH_INTERVAL_MINUTES, BACKFILL_FLAG
+from mlops.features import run_feature_engineering, run_feature_engineering_full
 from mlops.fetch import run_pipeline
+from mlops.backfill import run_backfill
 from mlops.train import train as run_train
 
 load_dotenv()
@@ -35,6 +36,23 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("everycoin.mlops.scheduler")
+
+
+def _backfill_once() -> None:
+    """Run 90-day backfill + full feature engineering exactly once.
+    A flag file on the persistent volume prevents re-runs on restart."""
+    if BACKFILL_FLAG.exists():
+        log.info("Backfill already done (flag found) — skipping")
+        return
+    log.info("=== First boot: running 90-day backfill ===")
+    try:
+        asyncio.run(run_backfill(days=90))
+        log.info("Backfill complete — computing features for all historical rows ...")
+        run_feature_engineering_full()
+        BACKFILL_FLAG.touch()
+        log.info("=== Backfill done | %s ===", db.row_counts())
+    except Exception as e:
+        log.error("=== Backfill FAILED: %s — will retry on next restart ===", e)
 
 
 def _tick() -> None:
@@ -80,7 +98,8 @@ def main() -> None:
     log.info("  Hourly fetch  : every %d min", args.interval)
     log.info("  Weekly retrain: every Sunday 02:00 UTC")
 
-    _tick()  # run immediately on startup
+    _backfill_once()  # no-op if flag exists, runs once on fresh volume
+    _tick()           # run first fetch immediately
 
     scheduler = BlockingScheduler(timezone="UTC")
 
