@@ -12,6 +12,7 @@ import httpx
 from mcp import types
 
 import rag
+from mlops.serve import predict as ml_predict
 
 log = logging.getLogger("everycoin.tools")
 
@@ -68,6 +69,20 @@ MCP_TOOLS: list[types.Tool] = [
                 }
             },
             "required": ["address"],
+        },
+    ),
+    types.Tool(
+        name="predict_ai_score",
+        description="Get ML-predicted AI score (0-100), price direction (BUY/HOLD/SELL), and confidence for a crypto coin based on technical indicators",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "CoinGecko coin id e.g. bitcoin, ethereum, solana",
+                }
+            },
+            "required": ["symbol"],
         },
     ),
     types.Tool(
@@ -204,6 +219,13 @@ async def analyze_wallet(address: str) -> dict:
             return {"error": str(e)}
 
 
+def predict_ai_score(symbol: str) -> dict:
+    try:
+        return ml_predict(symbol.lower())
+    except Exception as e:
+        return {"error": str(e), "coin_id": symbol, "ai_score": 50, "direction": "HOLD"}
+
+
 def search_knowledge(query: str, topic: str | None = None) -> dict:
     results = rag.search(query, topic=topic, n_results=3)
     if not results:
@@ -222,7 +244,9 @@ async def call_tool(name: str, arguments: dict) -> str:
     """Execute a tool by name and return result as JSON string."""
     log.info("  🔧 MCP tool called : %s | args: %s", name, arguments)
 
-    if name == "get_token_price":
+    if name == "predict_ai_score":
+        result = predict_ai_score(arguments["symbol"])
+    elif name == "get_token_price":
         result = await get_token_price(arguments["symbol"])
     elif name == "get_defi_stats":
         result = await get_defi_stats(arguments["protocol"])

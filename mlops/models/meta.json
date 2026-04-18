@@ -1,0 +1,24 @@
+{
+  "run_id": "ac8c315902ee43b6bdfc82f4674ebb86",
+  "roc_auc": 0.565,
+  "accuracy": 0.5389,
+  "features": [
+    "return_1h",
+    "return_6h",
+    "return_24h",
+    "sma_7",
+    "sma_24",
+    "ema_12",
+    "ema_26",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "rsi_14",
+    "bb_upper",
+    "bb_middle",
+    "bb_lower",
+    "bb_width",
+    "volatility_24h"
+  ],
+  "promoted_at": "2026-04-18T15:47:10.904582Z"
+}

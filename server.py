@@ -24,6 +24,7 @@ from starlette.routing import Route
 import mcp_tools
 import rag
 from graph import run_graph
+from mlops.serve import predict, predict_all
 
 load_dotenv()
 
@@ -139,6 +140,22 @@ async def handle_mcp(request: Request) -> JSONResponse:
         )
 
 
+# ── /predict/ai-score ────────────────────────────────────────────────────────
+
+async def handle_predict(request: Request) -> JSONResponse:
+    """
+    GET  /predict/ai-score?coin=bitcoin   — single coin
+    GET  /predict/ai-score                — all tracked coins
+    """
+    coin_id = request.query_params.get("coin")
+    try:
+        result = predict(coin_id) if coin_id else predict_all()
+        return JSONResponse(result, headers=_CORS)
+    except Exception as e:
+        log.exception("Prediction failed for coin=%s", coin_id)
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
+
+
 # ── /health ───────────────────────────────────────────────────────────────────
 
 async def handle_health(_request: Request) -> JSONResponse:
@@ -166,6 +183,7 @@ starlette_app = Starlette(
     routes=[
         Route("/api/chat", handle_chat, methods=["POST", "OPTIONS"]),
         Route("/mcp", handle_mcp, methods=["POST"]),
+        Route("/predict/ai-score", handle_predict, methods=["GET"]),
         Route("/health", handle_health, methods=["GET"]),
     ],
 )
