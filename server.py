@@ -140,6 +140,33 @@ async def handle_mcp(request: Request) -> JSONResponse:
         )
 
 
+# ── /prices ──────────────────────────────────────────────────────────────────
+
+async def handle_prices(request: Request) -> JSONResponse:
+    """
+    GET /prices?ids=bitcoin,ethereum,solana
+    Returns { coin_id: { price_usd, change_24h_pct } }
+    """
+    ids = request.query_params.get("ids", "")
+    if not ids:
+        return JSONResponse({"error": "ids param required"}, status_code=400, headers=_CORS)
+    try:
+        results = {}
+        import asyncio
+        tasks = [mcp_tools.get_token_price(cid.strip()) for cid in ids.split(",") if cid.strip()]
+        fetched = await asyncio.gather(*tasks)
+        for r in fetched:
+            if "error" not in r:
+                results[r["symbol"]] = {
+                    "price_usd": r["price_usd"],
+                    "change_24h_pct": r["change_24h_pct"],
+                }
+        return JSONResponse(results, headers=_CORS)
+    except Exception as e:
+        log.exception("Prices fetch failed")
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
+
+
 # ── /predict/ai-score ────────────────────────────────────────────────────────
 
 async def handle_predict(request: Request) -> JSONResponse:
@@ -183,6 +210,7 @@ starlette_app = Starlette(
     routes=[
         Route("/api/chat", handle_chat, methods=["POST", "OPTIONS"]),
         Route("/mcp", handle_mcp, methods=["POST"]),
+        Route("/prices", handle_prices, methods=["GET", "OPTIONS"]),
         Route("/predict/ai-score", handle_predict, methods=["GET"]),
         Route("/health", handle_health, methods=["GET"]),
     ],
