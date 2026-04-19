@@ -21,6 +21,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+import threading
+
 import mcp_tools
 import rag
 from graph import run_graph
@@ -205,6 +207,20 @@ async def handle_health(_request: Request) -> JSONResponse:
 @asynccontextmanager
 async def lifespan(_app):
     rag.init_rag()
+
+    # Run MLOps scheduler in background thread (same container = shared SQLite)
+    def _run_scheduler():
+        from mlops import db as mlops_db
+        from mlops.scheduler import main as scheduler_main
+        import sys
+        sys.argv = ["scheduler"]  # clear uvicorn args
+        mlops_db.init_db()
+        scheduler_main()
+
+    t = threading.Thread(target=_run_scheduler, daemon=True, name="mlops-scheduler")
+    t.start()
+    log.info("MLOps scheduler started in background thread")
+
     yield
 
 
