@@ -40,15 +40,22 @@ log = logging.getLogger("everycoin.mlops.scheduler")
 
 def _backfill_once() -> None:
     """Run 90-day backfill + full feature engineering exactly once.
-    A flag file on the persistent volume prevents re-runs on restart."""
+    Uses flag file (persistent volume) or row count as fallback guard."""
     if BACKFILL_FLAG.exists():
         log.info("Backfill already done (flag found) — skipping")
+        return
+    counts = db.row_counts()
+    if counts["price_history"] > 100:
+        log.info("DB already populated (%d rows) — skipping backfill", counts["price_history"])
+        BACKFILL_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        BACKFILL_FLAG.touch()
         return
     log.info("=== First boot: running 90-day backfill ===")
     try:
         asyncio.run(run_backfill(days=90))
         log.info("Backfill complete — computing features for all historical rows ...")
         run_feature_engineering_full()
+        BACKFILL_FLAG.parent.mkdir(parents=True, exist_ok=True)
         BACKFILL_FLAG.touch()
         log.info("=== Backfill done | %s ===", db.row_counts())
     except Exception as e:
