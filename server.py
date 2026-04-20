@@ -156,18 +156,33 @@ async def handle_prices(request: Request) -> JSONResponse:
     if not ids:
         return JSONResponse({"error": "ids param required"}, status_code=400, headers=_CORS)
     try:
+        import httpx
+        coin_ids = [cid.strip() for cid in ids.split(",") if cid.strip()]
+        # Single batched request — avoids 4 separate CoinGecko calls that each
+        # count against the free-tier rate limit (causing 429s on rapid refreshes).
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={
+                    "ids": ",".join(coin_ids),
+                    "vs_currencies": "usd",
+                    "include_24hr_change": "true",
+                },
+                timeout=10,
+            )
+        log.info("CoinGecko batch → status=%s ids=%s", res.status_code, coin_ids)
+        if res.status_code != 200:
+            log.warning("CoinGecko batch error: %s", res.text[:300])
+            return JSONResponse({}, headers=_CORS)
+        data = res.json()
         results = {}
-        import asyncio
-        tasks = [mcp_tools.get_token_price(cid.strip()) for cid in ids.split(",") if cid.strip()]
-        fetched = await asyncio.gather(*tasks)
-        for r in fetched:
-            if "error" not in r:
-                results[r["symbol"]] = {
-                    "price_usd": r["price_usd"],
-                    "change_24h_pct": r["change_24h_pct"],
+        for coin_id in coin_ids:
+            row = data.get(coin_id)
+            if row:
+                results[coin_id] = {
+                    "price_usd": row.get("usd"),
+                    "change_24h_pct": round(row.get("usd_24h_change", 0), 2),
                 }
-            else:
-                log.warning("get_token_price error: %s", r)
         log.info("handle_prices returning %d coins: %s", len(results), list(results.keys()))
         return JSONResponse(results, headers=_CORS)
     except Exception as e:
