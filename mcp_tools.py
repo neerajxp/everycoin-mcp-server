@@ -122,10 +122,11 @@ async def get_token_price(symbol: str) -> dict:
                 },
                 timeout=10,
             )
+            log.info("CoinGecko %s → status=%s body=%s", symbol, res.status_code, res.text[:200])
             data = res.json()
             coin_id = symbol.lower()
             if coin_id not in data:
-                return {"error": f"Token '{symbol}' not found on CoinGecko."}
+                return {"error": f"Token '{symbol}' not found on CoinGecko. Response: {res.text[:200]}"}
             coin = data[coin_id]
             return {
                 "symbol": coin_id,

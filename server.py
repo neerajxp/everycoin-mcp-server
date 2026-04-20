@@ -166,6 +166,9 @@ async def handle_prices(request: Request) -> JSONResponse:
                     "price_usd": r["price_usd"],
                     "change_24h_pct": r["change_24h_pct"],
                 }
+            else:
+                log.warning("get_token_price error: %s", r)
+        log.info("handle_prices returning %d coins: %s", len(results), list(results.keys()))
         return JSONResponse(results, headers=_CORS)
     except Exception as e:
         log.exception("Prices fetch failed")
