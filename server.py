@@ -316,6 +316,30 @@ async def handle_price_target(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
 
 
+# ── /predict/price-history ───────────────────────────────────────────────────
+
+async def handle_price_history(request: Request) -> JSONResponse:
+    """
+    GET /predict/price-history?coin=bitcoin&limit=7
+    Returns past predictions with actual prices and outcomes.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS)
+
+    coin_id = request.query_params.get("coin", "bitcoin")
+    limit   = min(int(request.query_params.get("limit", 7)), 30)
+
+    try:
+        from mlops import db as mlops_db
+        rows = mlops_db.prediction_history(coin_id, limit)
+        # Only return settled predictions (actual price recorded)
+        settled = [r for r in rows if r.get("actual_price")]
+        return JSONResponse(settled, headers=_CORS)
+    except Exception as e:
+        log.exception("price-history failed for %s", coin_id)
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
+
+
 # ── /health ───────────────────────────────────────────────────────────────────
 
 async def handle_health(_request: Request) -> JSONResponse:
@@ -360,6 +384,7 @@ starlette_app = Starlette(
         Route("/prices", handle_prices, methods=["GET", "OPTIONS"]),
         Route("/predict/ai-score", handle_predict, methods=["GET"]),
         Route("/predict/price-target", handle_price_target, methods=["GET", "OPTIONS"]),
+        Route("/predict/price-history", handle_price_history, methods=["GET", "OPTIONS"]),
         Route("/health", handle_health, methods=["GET"]),
     ],
 )
