@@ -206,6 +206,93 @@ async def handle_predict(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
 
 
+# ── /predict/price-target ────────────────────────────────────────────────────
+
+async def handle_price_target(request: Request) -> JSONResponse:
+    """
+    GET /predict/price-target?coin=bitcoin
+    Returns a 24h price target derived from current signals + model confidence.
+
+    Logic:
+      - Base expected move = return_1h × 24 (linear extrapolation)
+      - Scaled by AI score conviction: score 50 = no move, score 100 = full move
+      - Dampened by confidence: low confidence shrinks the predicted move
+      - Capped at ±15% to stay realistic
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS)
+
+    coin_id = request.query_params.get("coin", "bitcoin")
+
+    try:
+        import httpx
+        from mlops.serve import predict as ml_predict
+
+        # Get AI signals
+        pred = ml_predict(coin_id)
+        if pred.get("error") or not pred.get("signal"):
+            return JSONResponse({"error": "No signal data available"}, status_code=503, headers=_CORS)
+
+        signal = pred["signal"]
+        ai_score = pred["ai_score"]        # 0–100
+        confidence = pred["confidence"]    # 0–1
+
+        # return_1h is already in % (e.g. 0.3 means 0.3%)
+        return_1h = signal.get("return_1h", 0)
+
+        # Extrapolate 1h trend to 24h, dampened heavily (momentum fades)
+        raw_move_pct = return_1h * 8  # 8h equivalent, not full 24 (momentum dampener)
+
+        # Score conviction: score=50 → 0 bias, score=100 → full bullish, score=0 → full bearish
+        conviction = (ai_score - 50) / 50  # -1 to +1
+
+        # Blend: 60% momentum, 40% AI conviction
+        blended_pct = (raw_move_pct * 0.6) + (conviction * abs(raw_move_pct) * 0.4 + conviction * 2)
+
+        # Dampen by confidence (low confidence = smaller prediction)
+        predicted_move_pct = blended_pct * confidence
+
+        # Cap at ±15%
+        predicted_move_pct = max(-15.0, min(15.0, predicted_move_pct))
+        predicted_move_pct = round(predicted_move_pct, 2)
+
+        # Fetch current BTC price
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": coin_id, "vs_currencies": "usd"},
+                timeout=8,
+            )
+        if res.status_code != 200:
+            return JSONResponse({"error": "Price fetch failed"}, status_code=503, headers=_CORS)
+
+        current_price = res.json().get(coin_id, {}).get("usd")
+        if not current_price:
+            return JSONResponse({"error": "Price unavailable"}, status_code=503, headers=_CORS)
+
+        predicted_price = round(current_price * (1 + predicted_move_pct / 100), 2)
+        predicted_score = min(100, max(0, round(ai_score + conviction * 10 * confidence)))
+
+        log.info(
+            "price-target %s: current=$%.2f move=%.2f%% target=$%.2f predicted_score=%d",
+            coin_id, current_price, predicted_move_pct, predicted_price, predicted_score,
+        )
+
+        return JSONResponse({
+            "coin_id": coin_id,
+            "current_price": current_price,
+            "predicted_price": predicted_price,
+            "predicted_move_pct": predicted_move_pct,
+            "predicted_score": predicted_score,
+            "confidence": pred["confidence"],
+            "generated_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        }, headers=_CORS)
+
+    except Exception as e:
+        log.exception("price-target failed for %s", coin_id)
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
+
+
 # ── /health ───────────────────────────────────────────────────────────────────
 
 async def handle_health(_request: Request) -> JSONResponse:
@@ -249,6 +336,7 @@ starlette_app = Starlette(
         Route("/mcp", handle_mcp, methods=["POST"]),
         Route("/prices", handle_prices, methods=["GET", "OPTIONS"]),
         Route("/predict/ai-score", handle_predict, methods=["GET"]),
+        Route("/predict/price-target", handle_price_target, methods=["GET", "OPTIONS"]),
         Route("/health", handle_health, methods=["GET"]),
     ],
 )
