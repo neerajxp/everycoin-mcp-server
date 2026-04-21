@@ -85,6 +85,22 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_feature_coin
                 ON feature_store (coin_id, computed_at);
+
+            CREATE TABLE IF NOT EXISTS price_predictions (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                predicted_at        TEXT    NOT NULL,
+                coin_id             TEXT    NOT NULL,
+                current_price       REAL    NOT NULL,
+                predicted_price     REAL    NOT NULL,
+                predicted_move_pct  REAL    NOT NULL,
+                predicted_score     INTEGER NOT NULL,
+                confidence          REAL    NOT NULL,
+                actual_price        REAL,
+                outcome             TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pred_coin
+                ON price_predictions (coin_id, predicted_at);
         """)
     log.info("DB ready: %s", DB_PATH)
 
@@ -202,13 +218,67 @@ def latest_features(coin_id: str | None = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def insert_price_prediction(coin_id: str, current_price: float, predicted_price: float,
+                             predicted_move_pct: float, predicted_score: int, confidence: float) -> int:
+    ts = _now()
+    with _conn() as conn:
+        cur = conn.execute("""
+            INSERT INTO price_predictions
+                (predicted_at, coin_id, current_price, predicted_price,
+                 predicted_move_pct, predicted_score, confidence)
+            VALUES (?,?,?,?,?,?,?)
+        """, (ts, coin_id, current_price, predicted_price, predicted_move_pct, predicted_score, confidence))
+        row_id = cur.lastrowid
+    log.info("prediction saved: %s target=$%.2f move=%.2f%% id=%s", coin_id, predicted_price, predicted_move_pct, row_id)
+    return row_id
+
+
+def latest_prediction(coin_id: str) -> dict | None:
+    """Return the most recent prediction for a coin."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM price_predictions WHERE coin_id=? ORDER BY predicted_at DESC LIMIT 1",
+            (coin_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def prediction_history(coin_id: str, limit: int = 30) -> list[dict]:
+    """Return last N predictions for a coin."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM price_predictions WHERE coin_id=? ORDER BY predicted_at DESC LIMIT ?",
+            (coin_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_prediction_outcome(prediction_id: int, actual_price: float) -> None:
+    """Record actual price and outcome (Hit / Miss) for a past prediction."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT predicted_price FROM price_predictions WHERE id=?", (prediction_id,)
+        ).fetchone()
+        if not row:
+            return
+        predicted = row["predicted_price"]
+        diff_pct = abs(actual_price - predicted) / predicted * 100
+        outcome = "Hit" if diff_pct <= 3.0 else f"Miss {diff_pct:.1f}%"
+        conn.execute(
+            "UPDATE price_predictions SET actual_price=?, outcome=? WHERE id=?",
+            (actual_price, outcome, prediction_id),
+        )
+    log.info("outcome updated id=%d actual=$%.2f outcome=%s", prediction_id, actual_price, outcome)
+
+
 def row_counts() -> dict[str, int]:
     with _conn() as conn:
         return {
-            "price_history": conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0],
-            "gas_history":   conn.execute("SELECT COUNT(*) FROM gas_history").fetchone()[0],
-            "defi_history":  conn.execute("SELECT COUNT(*) FROM defi_history").fetchone()[0],
-            "feature_store": conn.execute("SELECT COUNT(*) FROM feature_store").fetchone()[0],
+            "price_history":     conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0],
+            "gas_history":       conn.execute("SELECT COUNT(*) FROM gas_history").fetchone()[0],
+            "defi_history":      conn.execute("SELECT COUNT(*) FROM defi_history").fetchone()[0],
+            "feature_store":     conn.execute("SELECT COUNT(*) FROM feature_store").fetchone()[0],
+            "price_predictions": conn.execute("SELECT COUNT(*) FROM price_predictions").fetchone()[0],
         }
 
 

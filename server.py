@@ -227,7 +227,30 @@ async def handle_price_target(request: Request) -> JSONResponse:
     try:
         import httpx
         from mlops.serve import predict as ml_predict
+        from mlops import db as mlops_db
+        from datetime import datetime, timezone
 
+        # ── Serve from daily DB prediction if it exists and is from today ──────
+        stored = mlops_db.latest_prediction(coin_id)
+        if stored:
+            predicted_at = datetime.fromisoformat(stored["predicted_at"])
+            age_hours = (datetime.now(timezone.utc) - predicted_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+            if age_hours <= 24:
+                log.info("Serving stored daily prediction for %s (age=%.1fh)", coin_id, age_hours)
+                return JSONResponse({
+                    "coin_id":            coin_id,
+                    "current_price":      stored["current_price"],
+                    "predicted_price":    stored["predicted_price"],
+                    "predicted_move_pct": stored["predicted_move_pct"],
+                    "predicted_score":    stored["predicted_score"],
+                    "confidence":         stored["confidence"],
+                    "generated_at":       stored["predicted_at"] + "Z",
+                    "actual_price":       stored.get("actual_price"),
+                    "outcome":            stored.get("outcome"),
+                    "source":             "scheduled",
+                }, headers=_CORS)
+
+        # ── Fallback: compute live ────────────────────────────────────────────
         # Get AI signals
         pred = ml_predict(coin_id)
         if pred.get("error") or not pred.get("signal"):
