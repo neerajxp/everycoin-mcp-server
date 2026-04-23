@@ -15,7 +15,7 @@ from pathlib import Path
 import pandas as pd
 from xgboost import XGBClassifier
 
-from mlops.config import DB_PATH, COINS
+from mlops.config import COINS
 from mlops import db
 
 log = logging.getLogger("everycoin.mlops.serve")

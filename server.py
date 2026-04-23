@@ -360,7 +360,7 @@ async def handle_health(_request: Request) -> JSONResponse:
 async def lifespan(_app):
     rag.init_rag()
 
-    # Run MLOps scheduler in background thread (same container = shared SQLite)
+    # Run MLOps scheduler in background thread
     def _run_scheduler():
         from mlops import db as mlops_db
         from mlops.scheduler import main as scheduler_main

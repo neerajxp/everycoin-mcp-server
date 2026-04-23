@@ -9,12 +9,6 @@ from pathlib import Path
 # ── Project root ──────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent.parent
 
-# ── SQLite database path ──────────────────────────────────────────────────────
-DB_PATH = ROOT / "mlops" / "data" / "market.db"
-
-# ── Backfill flag — presence means backfill already ran ──────────────────────
-BACKFILL_FLAG = ROOT / "mlops" / "data" / "backfill_done.flag"
-
 # ── Tokens to track (CoinGecko IDs) ──────────────────────────────────────────
 COINS: list[str] = [
     "bitcoin",

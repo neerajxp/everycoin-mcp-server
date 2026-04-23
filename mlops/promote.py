@@ -18,7 +18,6 @@ import mlflow
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
-from mlops.config import DB_PATH
 from mlops.train import _load_data, _prepare_features, _time_split, _train
 
 MODELS_DIR = Path(__file__).parent / "models"

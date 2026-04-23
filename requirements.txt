@@ -10,6 +10,7 @@ starlette>=0.37.0
 python-dotenv>=1.0.0
 mcp>=1.0.0
 # MLOps pipeline
+pymysql>=1.1.0
 apscheduler>=3.10.0
 pandas>=2.0.0
 xgboost>=2.0.0

@@ -16,12 +16,11 @@ Features per row:
 """
 
 import logging
-import sqlite3
 
 import pandas as pd
 
 from mlops import db
-from mlops.config import COINS, DB_PATH
+from mlops.config import COINS
 
 log = logging.getLogger("everycoin.mlops.features")
 
@@ -137,43 +136,15 @@ def _insert_all_rows(df: pd.DataFrame, coin_id: str) -> int:
     # Only keep rows with at least RSI available (needs 14 periods)
     valid = df.dropna(subset=["rsi_14"])
     count = 0
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        for _, row in valid.iterrows():
-            features = {col: _r(row.get(col)) for col in feature_cols}
-            features["price_usd"]  = _r(row["price_usd"])
-            features["market_cap"] = _r(row.get("market_cap"))
-            conn.execute("""
-                INSERT INTO feature_store (
-                    computed_at, coin_id, price_usd,
-                    return_1h, return_6h, return_24h,
-                    sma_7, sma_24, ema_12, ema_26,
-                    macd, macd_signal, macd_hist,
-                    rsi_14, bb_upper, bb_middle, bb_lower, bb_width,
-                    volatility_24h, market_cap
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                row["fetched_at"], coin_id, features["price_usd"],
-                features["return_1h"], features["return_6h"], features["return_24h"],
-                features["sma_7"], features["sma_24"],
-                features["ema_12"], features["ema_26"],
-                features["macd"], features["macd_signal"], features["macd_hist"],
-                features["rsi_14"],
-                features["bb_upper"], features["bb_middle"], features["bb_lower"], features["bb_width"],
-                features["volatility_24h"], features["market_cap"],
-            ))
-            count += 1
-        conn.commit()
-    finally:
-        conn.close()
+    for _, row in valid.iterrows():
+        features = {col: _r(row.get(col)) for col in feature_cols}
+        db.insert_features_at(row["fetched_at"], coin_id, features)
+        count += 1
     return count
 
 
 def _clear_feature_store() -> None:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("DELETE FROM feature_store")
-    conn.commit()
-    conn.close()
+    db.clear_feature_store()
     log.info("  feature_store cleared")
 
 

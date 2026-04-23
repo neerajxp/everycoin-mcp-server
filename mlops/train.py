@@ -37,7 +37,8 @@ from sklearn.metrics import (
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
-from mlops.config import DB_PATH, COINS
+from mlops.config import COINS
+from mlops import db as _db
 
 log = logging.getLogger("everycoin.mlops.train")
 
@@ -122,19 +123,21 @@ def main() -> None:
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 def _load_data(coin_id: str | None = None) -> pd.DataFrame:
-    import sqlite3
-    conn = sqlite3.connect(DB_PATH)
-    if coin_id:
-        df = pd.read_sql(
-            "SELECT * FROM feature_store WHERE coin_id=? ORDER BY computed_at",
-            conn, params=(coin_id,)
-        )
-    else:
-        df = pd.read_sql(
-            "SELECT * FROM feature_store ORDER BY coin_id, computed_at",
-            conn
-        )
-    conn.close()
+    import pymysql
+    conn = pymysql.connect(**_db._cfg())
+    try:
+        if coin_id:
+            df = pd.read_sql(
+                "SELECT * FROM feature_store WHERE coin_id=%s ORDER BY computed_at",
+                conn, params=(coin_id,)
+            )
+        else:
+            df = pd.read_sql(
+                "SELECT * FROM feature_store ORDER BY coin_id, computed_at",
+                conn
+            )
+    finally:
+        conn.close()
     return df
 
 
