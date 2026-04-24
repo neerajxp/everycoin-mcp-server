@@ -9,10 +9,12 @@ AI Score (0-100):
 
 import json
 import logging
+import os
 import pickle
 from pathlib import Path
 
 import pandas as pd
+from huggingface_hub import hf_hub_download
 from xgboost import XGBClassifier
 
 from mlops.config import COINS
@@ -48,9 +50,24 @@ def _load_model():
         return
 
     if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Model not found at {MODEL_PATH}. Run: python -m mlops.promote"
-        )
+        hf_token   = os.getenv("HF_TOKEN")
+        hf_repo_id = os.getenv("HF_REPO_ID")
+        if hf_token and hf_repo_id:
+            log.info("Model not found locally — downloading from HF: %s", hf_repo_id)
+            MODELS_DIR.mkdir(exist_ok=True)
+            for filename in ("best_model.ubj", "scaler.pkl", "meta.json"):
+                hf_hub_download(
+                    repo_id=hf_repo_id,
+                    filename=filename,
+                    local_dir=str(MODELS_DIR),
+                    token=hf_token,
+                )
+                log.info("  ✓ downloaded %s", filename)
+        else:
+            raise FileNotFoundError(
+                f"Model not found at {MODEL_PATH} and HF_TOKEN/HF_REPO_ID not set. "
+                "Run: python -m mlops.promote"
+            )
 
     _model = XGBClassifier()
     _model.load_model(str(MODEL_PATH))

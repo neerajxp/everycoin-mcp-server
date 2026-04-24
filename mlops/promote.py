@@ -8,15 +8,15 @@ Usage:
   python -m mlops.promote
 """
 
+import json
 import logging
+import os
 import pickle
-import shutil
 import sys
 from pathlib import Path
 
 import mlflow
-from sklearn.preprocessing import StandardScaler
-from xgboost import XGBClassifier
+from huggingface_hub import HfApi
 
 from mlops.train import _load_data, _prepare_features, _time_split, _train
 
@@ -79,7 +79,6 @@ def promote_best() -> dict:
     with open(scaler_path, "wb") as f:
         pickle.dump(scaler, f)
 
-    import json
     meta = {
         "run_id":   run_id,
         "roc_auc":  roc_auc,
@@ -93,6 +92,30 @@ def promote_best() -> dict:
     log.info("✓ Model saved  : %s", model_path)
     log.info("✓ Scaler saved : %s", scaler_path)
     log.info("✓ Meta saved   : %s", meta_path)
+
+    # Push to Hugging Face Hub
+    hf_token   = os.getenv("HF_TOKEN")
+    hf_repo_id = os.getenv("HF_REPO_ID")
+    if hf_token and hf_repo_id:
+        log.info("Pushing model to Hugging Face: %s ...", hf_repo_id)
+        api = HfApi()
+        for filename, path in [
+            ("best_model.ubj", model_path),
+            ("scaler.pkl",     scaler_path),
+            ("meta.json",      meta_path),
+        ]:
+            api.upload_file(
+                path_or_fileobj=str(path),
+                path_in_repo=filename,
+                repo_id=hf_repo_id,
+                token=hf_token,
+                repo_type="model",
+            )
+            log.info("  ✓ uploaded %s", filename)
+        log.info("✓ Model pushed to HF: https://huggingface.co/%s", hf_repo_id)
+    else:
+        log.warning("HF_TOKEN or HF_REPO_ID not set — skipping Hugging Face upload")
+
     return meta
 
 
