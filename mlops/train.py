@@ -23,6 +23,9 @@ import argparse
 import logging
 import sys
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import mlflow
 import mlflow.xgboost
 import pandas as pd
@@ -124,7 +127,16 @@ def main() -> None:
 
 def _load_data(coin_id: str | None = None) -> pd.DataFrame:
     import pymysql
-    conn = pymysql.connect(**_db._cfg())
+    from mlops.features import run_feature_engineering_full
+
+    # Auto-build features if feature_store is empty
+    counts = _db.row_counts()
+    if counts.get("feature_store", 0) == 0 and counts.get("price_history", 0) > 0:
+        log.info("feature_store is empty — running full feature build first ...")
+        run_feature_engineering_full()
+
+    cfg = {k: v for k, v in _db._cfg().items() if k != "cursorclass"}
+    conn = pymysql.connect(**cfg)
     try:
         if coin_id:
             df = pd.read_sql(

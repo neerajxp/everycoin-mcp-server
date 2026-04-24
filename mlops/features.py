@@ -125,7 +125,8 @@ def _build_df(rows: list[dict]) -> pd.DataFrame:
 # ── Writers ───────────────────────────────────────────────────────────────────
 
 def _insert_all_rows(df: pd.DataFrame, coin_id: str) -> int:
-    """Bulk insert all rows from df into feature_store. Returns count inserted."""
+    """Bulk insert all rows from df into feature_store using a single connection."""
+    import pymysql
     feature_cols = [
         "price_usd", "return_1h", "return_6h", "return_24h",
         "sma_7", "sma_24", "ema_12", "ema_26",
@@ -133,14 +134,32 @@ def _insert_all_rows(df: pd.DataFrame, coin_id: str) -> int:
         "rsi_14", "bb_upper", "bb_middle", "bb_lower", "bb_width",
         "volatility_24h", "market_cap",
     ]
-    # Only keep rows with at least RSI available (needs 14 periods)
     valid = df.dropna(subset=["rsi_14"])
-    count = 0
+    rows = []
     for _, row in valid.iterrows():
-        features = {col: _r(row.get(col)) for col in feature_cols}
-        db.insert_features_at(row["fetched_at"], coin_id, features)
-        count += 1
-    return count
+        rows.append((
+            row["fetched_at"], coin_id,
+            *[_r(row.get(col)) for col in feature_cols],
+        ))
+    if not rows:
+        return 0
+    conn = pymysql.connect(**db._cfg())
+    try:
+        with conn.cursor() as cur:
+            cur.executemany("""
+                INSERT INTO feature_store (
+                    computed_at, coin_id, price_usd,
+                    return_1h, return_6h, return_24h,
+                    sma_7, sma_24, ema_12, ema_26,
+                    macd, macd_signal, macd_hist,
+                    rsi_14, bb_upper, bb_middle, bb_lower, bb_width,
+                    volatility_24h, market_cap
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, rows)
+        conn.commit()
+    finally:
+        conn.close()
+    return len(rows)
 
 
 def _clear_feature_store() -> None:
