@@ -316,6 +316,69 @@ async def handle_price_target(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
 
 
+# ── /predict/btc-journey ─────────────────────────────────────────────────────
+
+async def handle_btc_journey(request: Request) -> JSONResponse:
+    """
+    GET /predict/btc-journey?date=YYYY-MM-DD
+    Returns hourly BTC prices + prediction for a 24h window.
+    date defaults to the most recent prediction date.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS)
+
+    from mlops import db as mlops_db
+    from datetime import datetime, timedelta, timezone
+
+    coin_id = "bitcoin"
+    date_str = request.query_params.get("date")
+
+    try:
+        available_dates = mlops_db.available_forecast_dates(coin_id, limit=7)
+
+        # Resolve which prediction to show
+        if date_str:
+            pred = mlops_db.prediction_for_date(coin_id, date_str)
+        else:
+            pred = mlops_db.latest_prediction(coin_id)
+            date_str = pred["predicted_at"][:10] if pred else datetime.now(timezone.utc).date().isoformat()
+
+        prices = []
+        window_start = None
+        window_end = None
+
+        if pred:
+            ws = pred["predicted_at"]
+            dt_pred = datetime.fromisoformat(ws if "+" in ws else ws + "+00:00")
+            dt_end  = dt_pred + timedelta(hours=24)
+
+            # Look back 2h from prediction time to find available price data
+            dt_look_back = dt_pred - timedelta(hours=2)
+            window_start = dt_look_back.isoformat(timespec="seconds")
+            window_end   = dt_end.isoformat(timespec="seconds")
+
+            rows = mlops_db.price_history_range(coin_id, window_start, window_end)
+            prices = [{"time": r["fetched_at"], "price": float(r["price_usd"])} for r in rows if r["price_usd"]]
+
+            # If still no prices, use the prediction's current_price as a single seed point
+            if not prices:
+                prices = [{"time": ws, "price": float(pred["current_price"])}]
+                window_start = ws
+
+        return JSONResponse({
+            "date": date_str,
+            "window_start": window_start,
+            "window_end": window_end,
+            "forecast": pred,
+            "prices": prices,
+            "available_dates": available_dates,
+        }, headers=_CORS)
+
+    except Exception as e:
+        log.exception("btc-journey failed")
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
+
+
 # ── /predict/price-history ───────────────────────────────────────────────────
 
 async def handle_price_history(request: Request) -> JSONResponse:
@@ -384,6 +447,7 @@ starlette_app = Starlette(
         Route("/prices", handle_prices, methods=["GET", "OPTIONS"]),
         Route("/predict/ai-score", handle_predict, methods=["GET"]),
         Route("/predict/price-target", handle_price_target, methods=["GET", "OPTIONS"]),
+        Route("/predict/btc-journey", handle_btc_journey, methods=["GET", "OPTIONS"]),
         Route("/predict/price-history", handle_price_history, methods=["GET", "OPTIONS"]),
         Route("/health", handle_health, methods=["GET"]),
     ],

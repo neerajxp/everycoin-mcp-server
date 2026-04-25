@@ -319,6 +319,43 @@ def prediction_history(coin_id: str, limit: int = 30) -> list[dict]:
             return cur.fetchall()
 
 
+def price_history_range(coin_id: str, start: str, end: str) -> list[dict]:
+    """Return hourly price rows between two ISO timestamps (inclusive)."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT fetched_at, price_usd FROM price_history "
+                "WHERE coin_id=%s AND fetched_at >= %s AND fetched_at <= %s "
+                "ORDER BY fetched_at ASC",
+                (coin_id, start, end),
+            )
+            return cur.fetchall()
+
+
+def available_forecast_dates(coin_id: str, limit: int = 7) -> list[str]:
+    """Return distinct YYYY-MM-DD strings for days that have predictions, newest first."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT LEFT(predicted_at, 10) AS date FROM price_predictions "
+                "WHERE coin_id=%s ORDER BY date DESC LIMIT %s",
+                (coin_id, limit),
+            )
+            return [row["date"] for row in cur.fetchall()]
+
+
+def prediction_for_date(coin_id: str, date_str: str) -> dict | None:
+    """Return the latest prediction for a given YYYY-MM-DD date."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM price_predictions WHERE coin_id=%s AND LEFT(predicted_at,10)=%s "
+                "ORDER BY predicted_at DESC LIMIT 1",
+                (coin_id, date_str),
+            )
+            return cur.fetchone()
+
+
 def row_counts() -> dict[str, int]:
     with _conn() as conn:
         with conn.cursor() as cur:
