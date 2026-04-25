@@ -350,20 +350,16 @@ async def handle_btc_journey(request: Request) -> JSONResponse:
         if pred:
             ws = pred["predicted_at"]
             dt_pred = datetime.fromisoformat(ws if "+" in ws else ws + "+00:00")
-            dt_end  = dt_pred + timedelta(hours=24)
-
-            # Look back 2h from prediction time to find available price data
-            dt_look_back = dt_pred - timedelta(hours=2)
-            window_start = dt_look_back.isoformat(timespec="seconds")
-            window_end   = dt_end.isoformat(timespec="seconds")
+            # Window is exactly 9pm → 9pm (prediction time to +24h)
+            window_start = dt_pred.isoformat(timespec="seconds")
+            window_end   = (dt_pred + timedelta(hours=24)).isoformat(timespec="seconds")
 
             rows = mlops_db.price_history_range(coin_id, window_start, window_end)
             prices = [{"time": r["fetched_at"], "price": float(r["price_usd"])} for r in rows if r["price_usd"]]
 
-            # If still no prices, use the prediction's current_price as a single seed point
+            # If no prices yet, seed with the prediction's current_price at start
             if not prices:
                 prices = [{"time": ws, "price": float(pred["current_price"])}]
-                window_start = ws
 
         return JSONResponse({
             "date": date_str,
