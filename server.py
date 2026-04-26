@@ -28,6 +28,8 @@ import rag
 from graph import run_graph
 from mlops.serve import predict, predict_all
 
+import httpx
+
 load_dotenv()
 
 logging.basicConfig(
@@ -35,6 +37,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 log = logging.getLogger("everycoin.server")
+
+_http: httpx.AsyncClient  # shared client, initialized in lifespan
 
 _CORS = {
     "Access-Control-Allow-Origin": "*",
@@ -399,6 +403,206 @@ async def handle_price_history(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
 
 
+# ── /whale/signals ────────────────────────────────────────────────────────────
+
+async def handle_whale_signals(request: Request) -> JSONResponse:
+    """
+    GET /whale/signals
+    Returns:
+      A) transactions  — large BTC whale moves via mempool.space (free, no key)
+      B) netflow       — derived buy/sell pressure from tx directions
+      C) futures       — funding rate, open interest, long/short ratio (Binance, free)
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS)
+
+    import asyncio
+    import time
+
+    # Known BTC exchange hot wallet addresses (publicly documented)
+    EXCHANGE_WALLETS: dict[str, str] = {
+        "3LYJfcfHPXYJreMsASk2jkn69LWEYKzexb": "Binance",
+        "34xp4vRoCGJym3xR7yCVPFHoCNxv4Twseo": "Binance",
+        "bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97": "Binance",
+        "1FzWLkAahHooV3kzTgyx6qsswXJ6sCXkSR": "Coinbase",
+        "3Cbq7aT1tY8kMxWLbitaG7yT6bPbKChq64": "Coinbase",
+        "bc1qazcm763858nkj2dj986etajv6wquslv8uxwczt": "Coinbase",
+        "1Kr6QSydW9bFQG1mXiPNNu6WpJGmUa9i1g": "Kraken",
+        "3E1jkD73KQXUL5LR1JmqaCMEXFG7ZoeFiy": "Kraken",
+        "1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s": "Bitfinex",
+        "3JZq4atUahhuA9rLhXLMhhTo133J9rq8dw": "Bitfinex",
+        "1LdRcdxfbSnmCYYNdeYpUnztiYzVfBEQeC": "OKX",
+        "bc1q9d3xa5gg45q2j39szguun6myggwydzhpf592de": "OKX",
+    }
+
+    MIN_BTC = 13.0   # ~$1M at $77k — small whale threshold
+
+    async def fetch_whale_txns():
+        try:
+            # Fetch recent confirmed transactions from mempool.space
+            # /api/v1/transactions gives recent mempool txs; we use block txs for confirmed
+            blocks_r = await _http.get("https://mempool.space/api/v1/blocks/tip/height", timeout=6)
+            if blocks_r.status_code != 200:
+                return []
+            tip = int(blocks_r.text.strip())
+
+            # Get current BTC price for USD value calculation
+            price_r = await _http.get(
+                "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+                timeout=6,
+            )
+            btc_price = 80000.0
+            if price_r.status_code == 200:
+                btc_price = price_r.json().get("bitcoin", {}).get("usd", 80000)
+
+            whale_txns = []
+
+            # Scan last 3 blocks
+            for block_height in range(tip, tip - 3, -1):
+                hash_r = await _http.get(f"https://mempool.space/api/block-height/{block_height}", timeout=6)
+                if hash_r.status_code != 200:
+                    continue
+                block_hash = hash_r.text.strip()
+
+                # Get block summary for timestamp
+                blk_r = await _http.get(f"https://mempool.space/api/block/{block_hash}", timeout=6)
+                block_ts = int(time.time())
+                if blk_r.status_code == 200:
+                    block_ts = blk_r.json().get("timestamp", block_ts)
+
+                # Fetch first page of txs (25 largest usually in first page)
+                txs_r = await _http.get(f"https://mempool.space/api/block/{block_hash}/txs/0", timeout=10)
+                if txs_r.status_code != 200:
+                    continue
+
+                for tx in txs_r.json():
+                    # Sum all outputs (skip OP_RETURN)
+                    vouts = [v for v in tx.get("vout", []) if v.get("value", 0) > 0]
+                    total_sat = sum(v["value"] for v in vouts)
+                    total_btc = total_sat / 1e8
+                    if total_btc < MIN_BTC:
+                        continue
+
+                    amount_usd = int(total_btc * btc_price)
+
+                    # Classify by matching output addresses to known exchange wallets
+                    out_addrs  = [v.get("scriptpubkey_address", "") for v in vouts]
+                    to_exchange = next((EXCHANGE_WALLETS[a] for a in out_addrs if a in EXCHANGE_WALLETS), None)
+
+                    # Input addresses (vin scriptpubkey_address if available)
+                    in_addrs    = [v.get("prevout", {}).get("scriptpubkey_address", "") for v in tx.get("vin", [])]
+                    from_exchange = next((EXCHANGE_WALLETS[a] for a in in_addrs if a in EXCHANGE_WALLETS), None)
+
+                    if to_exchange:
+                        signal     = "sell"   # moving TO exchange → likely selling
+                        from_label = "Wallet"
+                        to_label   = to_exchange
+                    elif from_exchange:
+                        signal     = "buy"    # moving FROM exchange → accumulation
+                        from_label = from_exchange
+                        to_label   = "Wallet"
+                    else:
+                        signal     = "move"   # wallet-to-wallet (OTC or cold storage)
+                        from_label = "Wallet"
+                        to_label   = "Wallet"
+
+                    # Size tier
+                    if amount_usd >= 50_000_000:
+                        tier = "market mover"
+                    elif amount_usd >= 10_000_000:
+                        tier = "big whale"
+                    else:
+                        tier = "whale"
+
+                    whale_txns.append({
+                        "hash":        tx.get("txid", "")[:12],
+                        "amount_btc":  round(total_btc, 1),
+                        "amount_usd":  amount_usd,
+                        "from_label":  from_label,
+                        "to_label":    to_label,
+                        "signal":      signal,
+                        "tier":        tier,
+                        "timestamp":   block_ts,
+                    })
+
+                    if len(whale_txns) >= 8:
+                        break
+                if len(whale_txns) >= 8:
+                    break
+
+            # Sort by size, return top 5
+            whale_txns.sort(key=lambda x: x["amount_btc"], reverse=True)
+            return whale_txns[:5]
+
+        except Exception:
+            log.exception("fetch_whale_txns failed")
+            return []
+
+    async def fetch_okx_futures():
+        # OKX public endpoints — no key, no US geo-block
+        try:
+            funding_r, oi_r, lsr_r = await asyncio.gather(
+                _http.get("https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP", timeout=6),
+                _http.get("https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP", timeout=6),
+                _http.get("https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader?instId=BTC-USDT-SWAP&period=1H", timeout=6),
+                return_exceptions=True,
+            )
+
+            funding_rate = None
+            if not isinstance(funding_r, Exception) and funding_r.status_code == 200:
+                data = funding_r.json().get("data", [])
+                if data:
+                    funding_rate = round(float(data[0]["fundingRate"]) * 100, 4)  # as %
+
+            open_interest_usd = None
+            oi_trend = None
+            if not isinstance(oi_r, Exception) and oi_r.status_code == 200:
+                data = oi_r.json().get("data", [])
+                if data:
+                    open_interest_usd = float(data[0]["oiUsd"])
+
+            long_short_ratio = None
+            if not isinstance(lsr_r, Exception) and lsr_r.status_code == 200:
+                rows = lsr_r.json().get("data", [])
+                if len(rows) >= 2:
+                    curr = float(rows[0][1])
+                    prev = float(rows[1][1])
+                    long_short_ratio = round(curr, 3)
+                    oi_trend = "up" if curr > prev else "down"
+                elif len(rows) == 1:
+                    long_short_ratio = round(float(rows[0][1]), 3)
+
+            return {
+                "funding_rate":      funding_rate,
+                "open_interest_usd": open_interest_usd,
+                "long_short_ratio":  long_short_ratio,
+                "oi_trend":          oi_trend,
+            }
+        except Exception:
+            log.exception("fetch_okx_futures failed")
+            return {}
+
+    txns, futures = await asyncio.gather(fetch_whale_txns(), fetch_okx_futures())
+
+    # Netflow signal derived from transaction directions
+    sells = sum(1 for t in txns if t["signal"] == "sell")
+    buys  = sum(1 for t in txns if t["signal"] == "buy")
+    if sells > buys:
+        netflow_signal = "sell_pressure"
+    elif buys > sells:
+        netflow_signal = "accumulation"
+    else:
+        netflow_signal = "neutral"
+
+    return JSONResponse({
+        "transactions":   txns,
+        "netflow_signal": netflow_signal,
+        "netflow_sells":  sells,
+        "netflow_buys":   buys,
+        "futures":        futures,
+    }, headers=_CORS)
+
+
 # ── /health ───────────────────────────────────────────────────────────────────
 
 async def handle_health(_request: Request) -> JSONResponse:
@@ -417,6 +621,8 @@ async def handle_health(_request: Request) -> JSONResponse:
 
 @asynccontextmanager
 async def lifespan(_app):
+    global _http
+    _http = httpx.AsyncClient(timeout=10)
     rag.init_rag()
 
     # Run MLOps scheduler in background thread
@@ -433,6 +639,7 @@ async def lifespan(_app):
     log.info("MLOps scheduler started in background thread")
 
     yield
+    await _http.aclose()
 
 
 starlette_app = Starlette(
@@ -445,6 +652,7 @@ starlette_app = Starlette(
         Route("/predict/price-target", handle_price_target, methods=["GET", "OPTIONS"]),
         Route("/predict/btc-journey", handle_btc_journey, methods=["GET", "OPTIONS"]),
         Route("/predict/price-history", handle_price_history, methods=["GET", "OPTIONS"]),
+        Route("/whale/signals", handle_whale_signals, methods=["GET", "OPTIONS"]),
         Route("/health", handle_health, methods=["GET"]),
     ],
 )
