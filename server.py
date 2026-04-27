@@ -403,6 +403,324 @@ async def handle_price_history(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
 
 
+# ── Technical indicator helpers ───────────────────────────────────────────────
+
+def _ema(prices: list, period: int) -> list:
+    k = 2 / (period + 1)
+    ema = [prices[0]]
+    for p in prices[1:]:
+        ema.append(p * k + ema[-1] * (1 - k))
+    return ema
+
+
+def _compute_rsi(prices: list, period: int = 14) -> float:
+    if len(prices) < period + 1:
+        return 50.0
+    deltas = [prices[i] - prices[i - 1] for i in range(len(prices) - period, len(prices))]
+    gains = sum(d for d in deltas if d > 0)
+    losses = sum(-d for d in deltas if d < 0)
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def _compute_macd(prices: list) -> tuple:
+    """Returns (macd_line, signal_line, histogram) for latest candle."""
+    if len(prices) < 26:
+        return 0.0, 0.0, 0.0
+    ema12 = _ema(prices, 12)
+    ema26 = _ema(prices, 26)
+    macd_line = [ema12[i] - ema26[i] for i in range(len(prices))]
+    signal = _ema(macd_line[-9:], 9) if len(macd_line) >= 9 else [macd_line[-1]]
+    hist = macd_line[-1] - signal[-1]
+    return macd_line[-1], signal[-1], hist
+
+
+def _compute_atr(prices: list, period: int = 14) -> float:
+    """Approximated ATR using |close[i] - close[i-1]| (no OHLC available)."""
+    if len(prices) < period + 1:
+        return 0.0
+    trs = [abs(prices[i] - prices[i - 1]) for i in range(len(prices) - period, len(prices))]
+    return sum(trs) / period
+
+
+# ── /predict/btc-momentum in-memory cache ─────────────────────────────────────
+
+_momentum_cache: dict = {}          # {"data": ..., "ts": float}
+_MOMENTUM_TTL = 30 * 60             # 30 minutes
+
+
+# ── /predict/btc-momentum ────────────────────────────────────────────────────
+
+async def handle_btc_momentum(request: Request) -> JSONResponse:
+    """
+    GET /predict/btc-momentum
+    Option C: blends the trained ML score (50%) with live indicator score (50%).
+    Picks a dynamic target window based on signal strength.
+    Cached 30 min in memory.
+
+    Response shape:
+      {
+        "blended_score":    0-100,
+        "ml_score":         0-100,
+        "live_score":       0-100,
+        "direction":        "BUY"|"HOLD"|"SELL",
+        "confidence":       0.0-1.0,
+        "current_price":    float,
+        "target_price":     float,
+        "target_pct":       float,          # e.g. 2.3 or -1.1
+        "window_hours":     int,            # 1 | 4 | 6 | 12 | 24
+        "forecast_at":      ISO str,
+        "target_at":        ISO str,
+        "signals": {
+            "rsi":          float,
+            "macd":         float,
+            "atr":          float,
+            "return_1h":    float,
+            "return_4h":    float,
+            "funding_rate": float | null,
+            "oi_trend":     "up"|"down"|null,
+            "whale_flow":   "accumulation"|"sell_pressure"|"neutral"
+        },
+        "cached": bool
+      }
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS)
+
+    import time as _time
+    import asyncio
+    from datetime import datetime, timezone, timedelta
+
+    now_ts = _time.time()
+
+    # Serve from cache if still fresh
+    if _momentum_cache.get("ts") and (now_ts - _momentum_cache["ts"]) < _MOMENTUM_TTL:
+        data = dict(_momentum_cache["data"])
+        data["cached"] = True
+        return JSONResponse(data, headers=_CORS)
+
+    try:
+        # ── 1. Fetch hourly BTC prices from CoinGecko (last 48h gives ~48 candles) ──
+        cg_r, okx_r = await asyncio.gather(
+            _http.get(
+                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+                "?vs_currency=usd&days=2&interval=hourly",
+                timeout=10,
+            ),
+            _http.get(
+                "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP",
+                timeout=6,
+            ),
+            return_exceptions=True,
+        )
+
+        prices_raw: list[float] = []
+        current_price: float = 0.0
+
+        if not isinstance(cg_r, Exception) and cg_r.status_code == 200:
+            pts = cg_r.json().get("prices", [])           # [[ts_ms, price], ...]
+            prices_raw = [p[1] for p in pts]
+            if prices_raw:
+                current_price = prices_raw[-1]
+
+        if not prices_raw or current_price == 0:
+            return JSONResponse({"error": "Unable to fetch price data"}, status_code=503, headers=_CORS)
+
+        # ── 2. Compute live indicators ─────────────────────────────────────────
+        rsi   = _compute_rsi(prices_raw, 14)
+        macd, _, macd_hist = _compute_macd(prices_raw)
+        atr   = _compute_atr(prices_raw, 14)
+
+        ret_1h  = ((prices_raw[-1] / prices_raw[-2])  - 1) * 100 if len(prices_raw) >= 2  else 0.0
+        ret_4h  = ((prices_raw[-1] / prices_raw[-5])  - 1) * 100 if len(prices_raw) >= 5  else 0.0
+        ret_24h = ((prices_raw[-1] / prices_raw[-25]) - 1) * 100 if len(prices_raw) >= 25 else 0.0
+
+        # Funding rate from OKX
+        funding_rate: float | None = None
+        if not isinstance(okx_r, Exception) and okx_r.status_code == 200:
+            data_f = okx_r.json().get("data", [])
+            if data_f:
+                funding_rate = round(float(data_f[0]["fundingRate"]) * 100, 4)
+
+        # Whale netflow (from cached whale signals if available — non-blocking)
+        whale_flow = "neutral"
+        try:
+            wh_r = await asyncio.wait_for(
+                _http.get("https://web-production-54968.up.railway.app/whale/signals", timeout=4),
+                timeout=5,
+            )
+            if wh_r.status_code == 200:
+                whale_flow = wh_r.json().get("netflow_signal", "neutral")
+        except Exception:
+            pass  # best-effort; don't fail momentum if whale call is slow
+
+        # ── 3. Live score (0–100) ──────────────────────────────────────────────
+        # Each signal contributes to a raw score, then normalise to 0–100.
+        live_components: list[float] = []
+
+        # RSI: 0 = deeply oversold (30→bullish reversal), 100 = deeply overbought
+        # We score it so >70 = overbought (bearish), <30 = oversold (bullish)
+        if rsi <= 30:
+            live_components.append(80.0)   # strong buy signal
+        elif rsi <= 45:
+            live_components.append(62.0)
+        elif rsi <= 55:
+            live_components.append(50.0)
+        elif rsi <= 70:
+            live_components.append(40.0)
+        else:
+            live_components.append(20.0)   # overbought → bearish
+
+        # MACD histogram
+        if macd_hist > 0:
+            live_components.append(min(50 + macd_hist / atr * 30, 85) if atr > 0 else 65)
+        else:
+            live_components.append(max(50 + macd_hist / atr * 30, 15) if atr > 0 else 35)
+
+        # 4h return
+        if ret_4h > 1.5:
+            live_components.append(75.0)
+        elif ret_4h > 0.3:
+            live_components.append(60.0)
+        elif ret_4h > -0.3:
+            live_components.append(50.0)
+        elif ret_4h > -1.5:
+            live_components.append(38.0)
+        else:
+            live_components.append(22.0)
+
+        # Funding rate (positive = longs paying → slightly bearish sentiment)
+        if funding_rate is not None:
+            if funding_rate < -0.03:
+                live_components.append(72.0)   # shorts paying → bullish
+            elif funding_rate < 0.03:
+                live_components.append(52.0)
+            elif funding_rate < 0.08:
+                live_components.append(42.0)
+            else:
+                live_components.append(25.0)   # over-leveraged longs → bearish
+
+        # Whale flow
+        if whale_flow == "accumulation":
+            live_components.append(72.0)
+        elif whale_flow == "sell_pressure":
+            live_components.append(28.0)
+        else:
+            live_components.append(50.0)
+
+        live_score = round(sum(live_components) / len(live_components))
+
+        # ── 4. ML score (from trained model) ──────────────────────────────────
+        ml_score = 50
+        ml_confidence = 0.5
+        try:
+            ml_result = predict("bitcoin")
+            if not ml_result.get("error"):
+                ml_score = ml_result["ai_score"]
+                ml_confidence = ml_result["confidence"]
+        except Exception:
+            pass
+
+        # ── 5. Blended score: ML 50% + live 50% ───────────────────────────────
+        blended = round(ml_score * 0.5 + live_score * 0.5)
+
+        # ── 6. Direction from blended score ───────────────────────────────────
+        if blended >= 62:
+            direction = "BUY"
+        elif blended <= 38:
+            direction = "SELL"
+        else:
+            direction = "HOLD"
+
+        # ── 7. Dynamic window based on signal agreement & momentum strength ────
+        # Signal agreement: do ML and live agree on direction?
+        ml_bull  = ml_score >= 55
+        live_bull = live_score >= 55
+        ml_bear  = ml_score <= 45
+        live_bear = live_score <= 45
+        signals_agree = (ml_bull and live_bull) or (ml_bear and live_bear)
+
+        abs_dev = abs(blended - 50)   # 0 = totally neutral, 50 = max conviction
+
+        if abs_dev >= 20 and signals_agree and abs(ret_4h) > 1.0:
+            window_hours = 4
+        elif abs_dev >= 15 and signals_agree:
+            window_hours = 6
+        elif abs_dev >= 10:
+            window_hours = 12
+        else:
+            window_hours = 24
+
+        # ── 8. Target price via ATR × window multiplier ────────────────────────
+        atr_hourly = atr  # already hourly ATR
+        multiplier = {4: 1.5, 6: 2.0, 12: 2.5, 24: 3.0}[window_hours]
+        raw_move = atr_hourly * multiplier
+
+        # Clamp to realistic range: 0.2% – 5%
+        max_move = current_price * 0.05
+        min_move = current_price * 0.002
+        move = max(min_move, min(raw_move, max_move))
+
+        if direction == "BUY":
+            target_price = round(current_price + move, 0)
+        elif direction == "SELL":
+            target_price = round(current_price - move, 0)
+        else:
+            # HOLD — narrow band, direction driven by blended lean
+            lean = 1 if blended >= 50 else -1
+            target_price = round(current_price + lean * move * 0.5, 0)
+
+        target_pct = round((target_price / current_price - 1) * 100, 2)
+
+        # ── 9. Confidence: combination of model confidence + signal agreement ──
+        agreement_bonus = 0.08 if signals_agree else -0.05
+        confidence = round(min(1.0, max(0.1, ml_confidence + agreement_bonus)), 3)
+
+        # ── 10. Timestamps ────────────────────────────────────────────────────
+        now_dt = datetime.now(timezone.utc)
+        forecast_at = now_dt.isoformat(timespec="seconds")
+        target_at   = (now_dt + timedelta(hours=window_hours)).isoformat(timespec="seconds")
+
+        result = {
+            "blended_score":  blended,
+            "ml_score":       ml_score,
+            "live_score":     live_score,
+            "direction":      direction,
+            "confidence":     confidence,
+            "current_price":  round(current_price, 0),
+            "target_price":   target_price,
+            "target_pct":     target_pct,
+            "window_hours":   window_hours,
+            "forecast_at":    forecast_at,
+            "target_at":      target_at,
+            "signals": {
+                "rsi":          round(rsi, 1),
+                "macd":         round(macd, 2),
+                "macd_hist":    round(macd_hist, 2),
+                "atr":          round(atr, 0),
+                "return_1h":    round(ret_1h, 2),
+                "return_4h":    round(ret_4h, 2),
+                "return_24h":   round(ret_24h, 2),
+                "funding_rate": funding_rate,
+                "whale_flow":   whale_flow,
+            },
+            "cached": False,
+        }
+
+        _momentum_cache["data"] = result
+        _momentum_cache["ts"]   = now_ts
+
+        return JSONResponse(result, headers=_CORS)
+
+    except Exception as e:
+        log.exception("btc-momentum failed")
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
+
+
 # ── /whale/signals ────────────────────────────────────────────────────────────
 
 async def handle_whale_signals(request: Request) -> JSONResponse:
@@ -649,6 +967,7 @@ starlette_app = Starlette(
         Route("/mcp", handle_mcp, methods=["POST"]),
         Route("/prices", handle_prices, methods=["GET", "OPTIONS"]),
         Route("/predict/ai-score", handle_predict, methods=["GET"]),
+        Route("/predict/btc-momentum", handle_btc_momentum, methods=["GET", "OPTIONS"]),
         Route("/predict/price-target", handle_price_target, methods=["GET", "OPTIONS"]),
         Route("/predict/btc-journey", handle_btc_journey, methods=["GET", "OPTIONS"]),
         Route("/predict/price-history", handle_price_history, methods=["GET", "OPTIONS"]),
