@@ -921,6 +921,201 @@ async def handle_whale_signals(request: Request) -> JSONResponse:
     }, headers=_CORS)
 
 
+# ── /predict/market-narrative ────────────────────────────────────────────────
+
+_narrative_cache: dict = {}
+_NARRATIVE_TTL = 30 * 60  # 30 minutes
+
+
+async def handle_market_narrative(request: Request) -> JSONResponse:
+    """
+    GET /predict/market-narrative
+    Returns:
+      - narrative: 2-3 sentence AI-written market brief (Claude Haiku)
+      - feed:      list of signal items derived from live data
+      - direction, blended_score, generated_at, cached
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS)
+
+    import asyncio
+    import time as _time
+    from datetime import datetime, timezone
+
+    now_ts = _time.time()
+
+    # Serve from cache if still fresh
+    if _narrative_cache.get("ts") and (now_ts - _narrative_cache["ts"]) < _NARRATIVE_TTL:
+        data = dict(_narrative_cache["data"])
+        data["cached"] = True
+        return JSONResponse(data, headers=_CORS)
+
+    try:
+        port = os.getenv("PORT", "8000")
+
+        # Gather momentum + whale data in parallel from internal endpoints
+        mom_r, whale_r = await asyncio.gather(
+            _http.get(f"http://localhost:{port}/predict/btc-momentum", timeout=8),
+            _http.get(f"http://localhost:{port}/whale/signals", timeout=8),
+            return_exceptions=True,
+        )
+
+        mom:   dict = {}
+        whale: dict = {}
+        if not isinstance(mom_r,   Exception) and mom_r.status_code   == 200: mom   = mom_r.json()
+        if not isinstance(whale_r, Exception) and whale_r.status_code == 200: whale = whale_r.json()
+
+        sig          = mom.get("signals", {})
+        rsi          = sig.get("rsi",          50)
+        macd_hist    = sig.get("macd_hist",     0)
+        ret_4h       = sig.get("return_4h",     0)
+        ret_24h      = sig.get("return_24h",    0)
+        funding_rate = sig.get("funding_rate")
+        whale_flow   = sig.get("whale_flow",   "neutral")
+        direction    = mom.get("direction",    "HOLD")
+        blended      = mom.get("blended_score", 50)
+        current_px   = mom.get("current_price", 0)
+        target_px    = mom.get("target_price",  0)
+        target_pct   = mom.get("target_pct",    0)
+        window_h     = mom.get("window_hours",  24)
+        confidence   = mom.get("confidence",    0.5)
+        ml_score     = mom.get("ml_score",      50)
+        macd_val     = sig.get("macd",          0)
+
+        whale_txns = whale.get("transactions", [])
+        netflow    = whale.get("netflow_signal", "neutral")
+        futures    = whale.get("futures", {})
+        oi_usd     = futures.get("open_interest_usd")
+        lsr        = futures.get("long_short_ratio")
+        oi_trend   = futures.get("oi_trend")
+
+        # ── Build signal feed (Option A) ─────────────────────────────────────
+        feed = []
+        generated_at = datetime.now(timezone.utc).isoformat()
+
+        # Whale transactions
+        for tx in whale_txns[:3]:
+            btc  = tx["amount_btc"]
+            usd  = tx["amount_usd"]
+            frm  = tx["from_label"]
+            to   = tx["to_label"]
+            sig_ = tx["signal"]
+            if sig_ == "sell":
+                icon = "🔴"; sentiment = "bearish"
+                text = f"{btc:.0f} BTC (${usd/1e6:.1f}M) moved {frm} → {to} — possible sell pressure"
+            elif sig_ == "buy":
+                icon = "🟢"; sentiment = "bullish"
+                text = f"{btc:.0f} BTC (${usd/1e6:.1f}M) moved {frm} → {to} — accumulation signal"
+            else:
+                icon = "🦈"; sentiment = "neutral"
+                text = f"{btc:.0f} BTC (${usd/1e6:.1f}M) moved {frm} → {to}"
+            feed.append({"icon": icon, "text": text, "sentiment": sentiment, "time": generated_at})
+
+        # RSI signal
+        if rsi < 35:
+            feed.append({"icon": "📉", "text": f"RSI at {rsi:.1f} — oversold, potential bounce zone", "sentiment": "bullish", "time": generated_at})
+        elif rsi > 65:
+            feed.append({"icon": "📈", "text": f"RSI at {rsi:.1f} — overbought, watch for pullback", "sentiment": "bearish", "time": generated_at})
+
+        # MACD histogram
+        if macd_hist > 0:
+            feed.append({"icon": "⚡", "text": "MACD histogram turning bullish momentum", "sentiment": "bullish", "time": generated_at})
+        elif macd_hist < 0:
+            feed.append({"icon": "📉", "text": "MACD histogram turning bearish momentum", "sentiment": "bearish", "time": generated_at})
+
+        # 4h return
+        if abs(ret_4h) >= 0.5:
+            sentiment = "bullish" if ret_4h > 0 else "bearish"
+            icon = "📈" if ret_4h > 0 else "📉"
+            feed.append({"icon": icon, "text": f"BTC 4h return: {ret_4h:+.2f}% — momentum {'building' if ret_4h > 0 else 'fading'}", "sentiment": sentiment, "time": generated_at})
+
+        # Funding rate
+        if funding_rate is not None:
+            if funding_rate > 0.05:
+                feed.append({"icon": "⚡", "text": f"Funding rate {funding_rate:.4f}% — longs over-leveraged, squeeze risk", "sentiment": "bearish", "time": generated_at})
+            elif funding_rate < -0.02:
+                feed.append({"icon": "⚡", "text": f"Funding rate {funding_rate:.4f}% — shorts over-leveraged, potential squeeze up", "sentiment": "bullish", "time": generated_at})
+
+        # Open interest trend
+        if oi_trend == "down":
+            feed.append({"icon": "📊", "text": "Open interest falling — positions closing, trend may be weakening", "sentiment": "bearish", "time": generated_at})
+        elif oi_trend == "up":
+            feed.append({"icon": "📊", "text": "Open interest rising — new money entering the market", "sentiment": "bullish", "time": generated_at})
+
+        # Long/short ratio
+        if lsr is not None:
+            if lsr < 0.8:
+                feed.append({"icon": "🔄", "text": f"L/S ratio {lsr:.3f} — more shorts than longs, squeeze setup possible", "sentiment": "bullish", "time": generated_at})
+            elif lsr > 1.3:
+                feed.append({"icon": "🔄", "text": f"L/S ratio {lsr:.3f} — longs dominating, elevated liquidation risk", "sentiment": "bearish", "time": generated_at})
+
+        # Netflow
+        if netflow == "sell_pressure":
+            feed.append({"icon": "🏦", "text": "Whale netflow: BTC moving to exchanges — distribution signal", "sentiment": "bearish", "time": generated_at})
+        elif netflow == "accumulation":
+            feed.append({"icon": "🏦", "text": "Whale netflow: BTC leaving exchanges — accumulation signal", "sentiment": "bullish", "time": generated_at})
+
+        feed = feed[:6]  # cap at 6 items
+
+        # ── Build narrative prompt ────────────────────────────────────────────
+        price_str    = f"${current_px:,.0f}" if current_px else "unknown"
+        target_str   = f"${target_px:,.0f} ({target_pct:+.2f}%)" if target_px else "uncertain"
+        lsr_str      = f"{lsr:.3f}" if lsr is not None else "N/A"
+        funding_str  = f"{funding_rate:.4f}%" if funding_rate is not None else "N/A"
+
+        prompt = f"""You are a concise crypto market analyst. Write exactly 2-3 sentences summarising current BTC market conditions for a retail trader. Be specific with numbers. Do not use markdown, headers, or bullet points.
+
+Data:
+- BTC price: {price_str}
+- AI blended score: {blended}/100, direction: {direction}
+- ML model score: {ml_score}/100, confidence: {int(confidence*100)}%
+- Target: {target_str} over {window_h}h
+- RSI-14: {rsi:.1f}, MACD: {macd_val:.2f}, MACD hist: {macd_hist:.2f}
+- 4h return: {ret_4h:+.2f}%, 24h return: {ret_24h:+.2f}%
+- Whale flow: {whale_flow}, netflow: {netflow}
+- OKX funding rate: {funding_str}
+- Long/short ratio: {lsr_str}
+- Open interest trend: {oi_trend or 'unknown'}
+
+Write your 2-3 sentence market brief now:"""
+
+        # ── Call Claude Haiku ─────────────────────────────────────────────────
+        narrative = ""
+        try:
+            from langchain_anthropic import ChatAnthropic
+            from langchain_core.messages import HumanMessage
+            llm = ChatAnthropic(model="claude-haiku-4-5-20251001", max_tokens=256, temperature=0.4)
+            response = await llm.ainvoke([HumanMessage(content=prompt)])
+            narrative = response.content.strip()
+        except Exception:
+            log.exception("Claude narrative generation failed")
+            # Fallback: construct narrative from data
+            dir_word = "bullish" if direction == "BUY" else ("bearish" if direction == "SELL" else "neutral")
+            narrative = (
+                f"BTC is trading at {price_str} with a {dir_word} AI signal (score {blended}/100). "
+                f"RSI at {rsi:.1f} and {ret_24h:+.2f}% 24h return with {netflow.replace('_', ' ')} whale activity. "
+                f"Short-term target {target_str} over {window_h}h."
+            )
+
+        result = {
+            "narrative":     narrative,
+            "feed":          feed,
+            "direction":     direction,
+            "blended_score": blended,
+            "generated_at":  generated_at,
+            "cached":        False,
+        }
+
+        _narrative_cache["data"] = result
+        _narrative_cache["ts"]   = now_ts
+
+        return JSONResponse(result, headers=_CORS)
+
+    except Exception as e:
+        log.exception("market-narrative failed")
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
+
+
 # ── /health ───────────────────────────────────────────────────────────────────
 
 async def handle_health(_request: Request) -> JSONResponse:
@@ -972,6 +1167,7 @@ starlette_app = Starlette(
         Route("/predict/btc-journey", handle_btc_journey, methods=["GET", "OPTIONS"]),
         Route("/predict/price-history", handle_price_history, methods=["GET", "OPTIONS"]),
         Route("/whale/signals", handle_whale_signals, methods=["GET", "OPTIONS"]),
+        Route("/predict/market-narrative", handle_market_narrative, methods=["GET", "OPTIONS"]),
         Route("/health", handle_health, methods=["GET"]),
     ],
 )
