@@ -1075,6 +1075,83 @@ async def handle_manifold(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
 
 
+# ── /predict/trending-chips ──────────────────────────────────────────────────
+
+_chips_cache: dict = {}
+_CHIPS_TTL = 1800  # 30 min
+
+async def handle_trending_chips(request: Request) -> JSONResponse:
+    """
+    GET /predict/trending-chips
+    Returns 8 hot chip prompts derived from CoinGecko trending coins +
+    top Polymarket question + a few evergreen topics.
+    """
+    import time
+    now_ts = time.time()
+
+    if _chips_cache.get("ts") and (now_ts - _chips_cache["ts"]) < _CHIPS_TTL:
+        return JSONResponse(_chips_cache["data"], headers=_CORS)
+
+    chips: list[str] = []
+
+    try:
+        # 1. CoinGecko trending — top 7 coins
+        r = await _http.get(
+            "https://api.coingecko.com/api/v3/search/trending",
+            timeout=6,
+        )
+        trending = r.json().get("coins", [])[:6]
+        templates = [
+            "Is {name} a buy right now?",
+            "What's driving {name} today?",
+            "{symbol} price prediction",
+            "Should I hold {name}?",
+            "{name} technical analysis",
+            "Risks of investing in {name}",
+        ]
+        for i, coin in enumerate(trending):
+            item = coin.get("item", {})
+            name   = item.get("name", "")
+            symbol = item.get("symbol", "")
+            if name:
+                chips.append(templates[i % len(templates)].format(name=name, symbol=symbol))
+    except Exception:
+        log.warning("trending-chips: CoinGecko fetch failed")
+
+    # 2. Top Polymarket question as a chip
+    try:
+        if _polymarket_cache.get("data"):
+            markets = _polymarket_cache["data"].get("markets", [])
+            if markets:
+                q = markets[0]["question"]
+                # trim to ~40 chars for chip display
+                chips.append(q if len(q) <= 42 else q[:40].rstrip() + "…")
+    except Exception:
+        pass
+
+    # 3. Evergreen fallbacks — pad to 8
+    evergreen = [
+        "DeFi market outlook",
+        "Best L2s right now",
+        "Bear market strategy",
+        "How to spot a rug pull",
+        "Cold wallet setup guide",
+        "Yield farming risks",
+        "MEV explained simply",
+        "ETH gas tips",
+    ]
+    for e in evergreen:
+        if len(chips) >= 8:
+            break
+        if e not in chips:
+            chips.append(e)
+
+    result = {"chips": chips[:8]}
+    _chips_cache["data"] = result
+    _chips_cache["ts"]   = now_ts
+    return JSONResponse(result, headers=_CORS)
+
+
 # ── /predict/market-narrative ────────────────────────────────────────────────
 
 _narrative_cache: dict = {}
@@ -1324,6 +1401,7 @@ starlette_app = Starlette(
         Route("/whale/signals", handle_whale_signals, methods=["GET", "OPTIONS"]),
         Route("/predict/polymarket",        handle_polymarket,        methods=["GET", "OPTIONS"]),
         Route("/predict/manifold",          handle_manifold,          methods=["GET", "OPTIONS"]),
+        Route("/predict/trending-chips",    handle_trending_chips,    methods=["GET", "OPTIONS"]),
         Route("/predict/market-narrative", handle_market_narrative, methods=["GET", "OPTIONS"]),
         Route("/health", handle_health, methods=["GET"]),
     ],
