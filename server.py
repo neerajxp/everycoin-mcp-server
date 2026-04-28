@@ -921,6 +921,81 @@ async def handle_whale_signals(request: Request) -> JSONResponse:
     }, headers=_CORS)
 
 
+# ── /predict/polymarket ──────────────────────────────────────────────────────
+
+_polymarket_cache: dict = {}
+_POLYMARKET_TTL = 60 * 60  # 1 hour
+
+
+async def handle_polymarket(request: Request) -> JSONResponse:
+    """
+    GET /predict/polymarket
+    Fetches active crypto prediction markets from Polymarket gamma API.
+    Uses known slugs as primary source + parallel scan as supplement.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS)
+
+    import time as _time
+    import asyncio
+
+    now_ts = _time.time()
+    if _polymarket_cache.get("ts") and (now_ts - _polymarket_cache["ts"]) < _POLYMARKET_TTL:
+        return JSONResponse(_polymarket_cache["data"], headers=_CORS)
+
+    CRYPTO_KW = [
+        "bitcoin", "btc", "ethereum", " eth ", "solana", "crypto",
+        "microstrategy", "coinbase", "ripple", "xrp", "defi", "blockchain",
+    ]
+
+    def parse_market(m: dict) -> dict | None:
+        if not isinstance(m, dict):
+            return None
+        q = m.get("question", "").lower()
+        if not any(kw in q for kw in CRYPTO_KW):
+            return None
+        try:
+            prices   = json.loads(m.get("outcomePrices", "[]"))
+            yes_prob = round(float(prices[0]) * 100) if prices else 50
+        except Exception:
+            yes_prob = 50
+        return {
+            "question": m.get("question", ""),
+            "yes_prob": yes_prob,
+            "volume":   round(float(m.get("volume", 0))),
+            "end_date": str(m.get("endDate", ""))[:10],
+            "url":      f"https://polymarket.com/event/{m.get('slug', '')}",
+        }
+
+    async def fetch_page(offset: int) -> list:
+        try:
+            r = await _http.get(
+                f"https://gamma-api.polymarket.com/markets"
+                f"?active=true&closed=false&limit=500&offset={offset}",
+                timeout=12,
+            )
+            if r.status_code != 200:
+                return []
+            return [m for m in (parse_market(x) for x in r.json()) if m]
+        except Exception:
+            return []
+
+    try:
+        # Fetch 4 pages in parallel
+        pages = await asyncio.gather(*[fetch_page(o) for o in [0, 500, 1000, 1500]])
+        markets: list = [m for page in pages for m in page]
+
+        markets.sort(key=lambda x: -x["volume"])
+        result = {"markets": markets[:5], "fetched_at": now_ts}
+        _polymarket_cache["data"] = result
+        _polymarket_cache["ts"]   = now_ts
+        return JSONResponse(result, headers=_CORS)
+
+    except Exception as e:
+        log.exception("polymarket fetch failed")
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
+
+
 # ── /predict/market-narrative ────────────────────────────────────────────────
 
 _narrative_cache: dict = {}
@@ -1168,6 +1243,7 @@ starlette_app = Starlette(
         Route("/predict/btc-journey", handle_btc_journey, methods=["GET", "OPTIONS"]),
         Route("/predict/price-history", handle_price_history, methods=["GET", "OPTIONS"]),
         Route("/whale/signals", handle_whale_signals, methods=["GET", "OPTIONS"]),
+        Route("/predict/polymarket",        handle_polymarket,        methods=["GET", "OPTIONS"]),
         Route("/predict/market-narrative", handle_market_narrative, methods=["GET", "OPTIONS"]),
         Route("/health", handle_health, methods=["GET"]),
     ],
