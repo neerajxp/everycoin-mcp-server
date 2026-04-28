@@ -996,6 +996,85 @@ async def handle_polymarket(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
 
 
+# ── /predict/manifold ────────────────────────────────────────────────────────
+
+_manifold_cache: dict = {}
+_MANIFOLD_TTL = 60 * 60  # 1 hour
+
+
+async def handle_manifold(request: Request) -> JSONResponse:
+    """
+    GET /predict/manifold
+    Fetches top crypto prediction markets from Manifold Markets (free, no auth).
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS)
+
+    import time as _time
+    import asyncio
+
+    now_ts = _time.time()
+    if _manifold_cache.get("ts") and (now_ts - _manifold_cache["ts"]) < _MANIFOLD_TTL:
+        return JSONResponse(_manifold_cache["data"], headers=_CORS)
+
+    TERMS = ["bitcoin", "ethereum", "BTC price", "crypto market", "solana"]
+
+    async def fetch_term(term: str) -> list:
+        try:
+            r = await _http.get(
+                "https://api.manifold.markets/v0/search-markets",
+                params={"term": term, "limit": 5, "filter": "open", "sort": "liquidity"},
+                timeout=8,
+            )
+            if r.status_code != 200:
+                return []
+            return [
+                m for m in r.json()
+                if isinstance(m, dict)
+                and m.get("outcomeType") == "BINARY"
+                and not m.get("isResolved")
+                and m.get("probability") is not None
+                and m.get("volume", 0) > 500
+            ]
+        except Exception:
+            return []
+
+    try:
+        pages = await asyncio.gather(*[fetch_term(t) for t in TERMS])
+        seen: set = set()
+        markets = []
+        for page in pages:
+            for m in page:
+                mid = m.get("id")
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                close_ts = m.get("closeTime", 0)
+                close_date = ""
+                if close_ts and close_ts < 32535212340000:  # skip "never" markets
+                    from datetime import datetime, timezone
+                    close_date = datetime.fromtimestamp(close_ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                markets.append({
+                    "question":    m.get("question", ""),
+                    "probability": round(m.get("probability", 0.5) * 100),
+                    "volume":      round(m.get("volume", 0)),
+                    "liquidity":   round(m.get("totalLiquidity", 0)),
+                    "close_date":  close_date,
+                    "url":         m.get("url", ""),
+                    "bettors":     m.get("uniqueBettorCount", 0),
+                })
+
+        markets.sort(key=lambda x: -x["liquidity"])
+        result = {"markets": markets[:6], "fetched_at": now_ts}
+        _manifold_cache["data"] = result
+        _manifold_cache["ts"]   = now_ts
+        return JSONResponse(result, headers=_CORS)
+
+    except Exception as e:
+        log.exception("manifold fetch failed")
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
+
+
 # ── /predict/market-narrative ────────────────────────────────────────────────
 
 _narrative_cache: dict = {}
@@ -1244,6 +1323,7 @@ starlette_app = Starlette(
         Route("/predict/price-history", handle_price_history, methods=["GET", "OPTIONS"]),
         Route("/whale/signals", handle_whale_signals, methods=["GET", "OPTIONS"]),
         Route("/predict/polymarket",        handle_polymarket,        methods=["GET", "OPTIONS"]),
+        Route("/predict/manifold",          handle_manifold,          methods=["GET", "OPTIONS"]),
         Route("/predict/market-narrative", handle_market_narrative, methods=["GET", "OPTIONS"]),
         Route("/health", handle_health, methods=["GET"]),
     ],
