@@ -943,9 +943,10 @@ async def handle_market_narrative(request: Request) -> JSONResponse:
     from datetime import datetime, timezone
 
     now_ts = _time.time()
+    bust   = "t" in request.query_params  # ?t=... busts server cache
 
-    # Serve from cache if still fresh
-    if _narrative_cache.get("ts") and (now_ts - _narrative_cache["ts"]) < _NARRATIVE_TTL:
+    # Serve from cache if still fresh (unless busted)
+    if not bust and _narrative_cache.get("ts") and (now_ts - _narrative_cache["ts"]) < _NARRATIVE_TTL:
         data = dict(_narrative_cache["data"])
         data["cached"] = True
         return JSONResponse(data, headers=_CORS)
