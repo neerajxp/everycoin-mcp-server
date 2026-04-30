@@ -924,14 +924,14 @@ async def handle_whale_signals(request: Request) -> JSONResponse:
 # ── /predict/polymarket ──────────────────────────────────────────────────────
 
 _polymarket_cache: dict = {}
-_POLYMARKET_TTL = 60 * 60  # 1 hour
+_POLYMARKET_TTL = 15 * 60  # 15 min
 
 
 async def handle_polymarket(request: Request) -> JSONResponse:
     """
     GET /predict/polymarket
-    Fetches active crypto prediction markets from Polymarket gamma API.
-    Uses known slugs as primary source + parallel scan as supplement.
+    Fetches active crypto prediction markets from Polymarket gamma events API.
+    Uses event slug for working URLs and outcomePrices from open markets only.
     """
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_CORS)
@@ -944,49 +944,77 @@ async def handle_polymarket(request: Request) -> JSONResponse:
         return JSONResponse(_polymarket_cache["data"], headers=_CORS)
 
     CRYPTO_KW = [
-        "bitcoin", "btc", "ethereum", " eth ", "solana", "crypto",
+        "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto",
         "microstrategy", "coinbase", "ripple", "xrp", "defi", "blockchain",
+        "token", "altcoin", "stablecoin", "megaeth", "opensea",
     ]
 
-    def parse_market(m: dict) -> dict | None:
-        if not isinstance(m, dict):
-            return None
-        q = m.get("question", "").lower()
-        if not any(kw in q for kw in CRYPTO_KW):
-            return None
-        try:
-            prices   = json.loads(m.get("outcomePrices", "[]"))
-            yes_prob = round(float(prices[0]) * 100) if prices else 50
-        except Exception:
-            yes_prob = 50
-        return {
-            "question": m.get("question", ""),
-            "yes_prob": yes_prob,
-            "volume":   round(float(m.get("volume", 0))),
-            "end_date": str(m.get("endDate", ""))[:10],
-            "url":      f"https://polymarket.com/event/{m.get('slug', '')}",
-        }
-
-    async def fetch_page(offset: int) -> list:
+    async def fetch_events(params: str) -> list:
         try:
             r = await _http.get(
-                f"https://gamma-api.polymarket.com/markets"
-                f"?active=true&closed=false&limit=500&offset={offset}",
+                f"https://gamma-api.polymarket.com/events?active=true&closed=false&{params}",
                 timeout=12,
             )
-            if r.status_code != 200:
-                return []
-            return [m for m in (parse_market(x) for x in r.json()) if m]
+            return r.json() if r.status_code == 200 else []
         except Exception:
             return []
 
+    def parse_event(event: dict) -> dict | None:
+        title = (event.get("title") or "").lower()
+        event_slug = event.get("slug", "")
+        if not event_slug:
+            return None
+
+        # Find first open market with real price data
+        for m in event.get("markets", []):
+            if m.get("closed"):
+                continue
+            try:
+                prices = json.loads(m.get("outcomePrices") or "[]")
+                if not prices:
+                    continue
+                yes_prob = round(float(prices[0]) * 100)
+            except Exception:
+                continue
+
+            # Skip fully resolved markets (0% or 100%)
+            if yes_prob in (0, 100):
+                continue
+
+            question = m.get("question") or event.get("title") or ""
+            return {
+                "question": question,
+                "yes_prob": yes_prob,
+                "volume":   round(float(event.get("volume") or 0)),
+                "end_date": (m.get("endDate") or "")[:10],
+                "url":      f"https://polymarket.com/event/{event_slug}",
+            }
+        return None
+
     try:
-        # Fetch 4 pages in parallel
-        pages = await asyncio.gather(*[fetch_page(o) for o in [0, 500, 1000, 1500]])
-        markets: list = [m for page in pages for m in page]
+        # Fetch crypto-tagged events + high-volume events in parallel
+        pages = await asyncio.gather(
+            fetch_events("tag_slug=crypto&limit=100&order=volume&ascending=false"),
+            fetch_events("limit=100&order=volume24hr&ascending=false"),
+        )
+        seen: set = set()
+        markets: list = []
+        for page in pages:
+            for event in page:
+                title = (event.get("title") or "").lower()
+                slug  = event.get("slug", "")
+                if slug in seen:
+                    continue
+                # Only keep crypto-related events
+                if not any(kw in title for kw in CRYPTO_KW):
+                    continue
+                parsed = parse_event(event)
+                if parsed:
+                    seen.add(slug)
+                    markets.append(parsed)
 
         markets.sort(key=lambda x: -x["volume"])
-        result = {"markets": markets[:5], "fetched_at": now_ts}
+        result = {"markets": markets[:6], "fetched_at": now_ts}
         _polymarket_cache["data"] = result
         _polymarket_cache["ts"]   = now_ts
         return JSONResponse(result, headers=_CORS)
