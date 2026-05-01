@@ -969,22 +969,35 @@ async def handle_polymarket(request: Request) -> JSONResponse:
             return []
 
     def parse_market(m: dict) -> dict | None:
+        mid = m.get("id", "?")
         if not isinstance(m, dict):
+            log.info("[polymarket] skip %s — not a dict", mid)
             return None
         if m.get("closed"):
+            log.info("[polymarket] skip %s — closed", mid)
             return None
         q = (m.get("question") or "").lower()
-        if not any(kw in q for kw in CRYPTO_KW):
+        kw_match = next((kw for kw in CRYPTO_KW if kw in q), None)
+        if not kw_match:
+            log.info("[polymarket] skip %s — no crypto kw in %r", mid, q[:80])
             return None
+        log.info("[polymarket] kw_pass %s — matched %r in %r", mid, kw_match, q[:80])
+
+        raw_prices = m.get("outcomePrices")
+        log.info("[polymarket] %s outcomePrices raw=%r", mid, raw_prices)
         try:
-            prices = json.loads(m.get("outcomePrices") or "[]")
+            prices = json.loads(raw_prices or "[]")
             if not prices:
+                log.info("[polymarket] skip %s — outcomePrices parsed to empty list", mid)
                 return None
             yes_prob = round(float(prices[0]) * 100)
-        except Exception:
+            log.info("[polymarket] %s parsed yes_prob=%s", mid, yes_prob)
+        except Exception as exc:
+            log.info("[polymarket] skip %s — parse error: %s", mid, exc)
             return None
         # Skip effectively resolved (<1% or >99%)
         if yes_prob < 1 or yes_prob > 99:
+            log.info("[polymarket] skip %s — yes_prob=%s out of 1-99 range", mid, yes_prob)
             return None
         slug = m.get("slug", "")
         return {
