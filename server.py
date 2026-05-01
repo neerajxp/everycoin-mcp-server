@@ -950,14 +950,22 @@ async def handle_polymarket(request: Request) -> JSONResponse:
     ]
 
     async def fetch_markets(tag: str) -> list:
+        url = f"https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&tag_slug={tag}"
         try:
-            r = await _http.get(
-                f"https://gamma-api.polymarket.com/markets"
-                f"?active=true&closed=false&limit=100&tag_slug={tag}",
-                timeout=12,
-            )
-            return r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
-        except Exception:
+            log.info("[polymarket] fetching tag=%s url=%s", tag, url)
+            r = await _http.get(url, timeout=12)
+            log.info("[polymarket] tag=%s status=%s body_len=%s", tag, r.status_code, len(r.content))
+            if r.status_code != 200:
+                log.warning("[polymarket] non-200 for tag=%s: %s", tag, r.text[:500])
+                return []
+            data = r.json()
+            if not isinstance(data, list):
+                log.warning("[polymarket] unexpected response type for tag=%s: %s", tag, str(data)[:200])
+                return []
+            log.info("[polymarket] tag=%s got %d markets", tag, len(data))
+            return data
+        except Exception as exc:
+            log.exception("[polymarket] fetch failed for tag=%s: %s", tag, exc)
             return []
 
     def parse_market(m: dict) -> dict | None:
@@ -992,6 +1000,7 @@ async def handle_polymarket(request: Request) -> JSONResponse:
             fetch_markets("crypto"),
             fetch_markets("bitcoin"),
         )
+        log.info("[polymarket] pages fetched: %s", [len(p) for p in pages])
         seen: set = set()
         candidates: list = []
         for page in pages:
@@ -1004,6 +1013,7 @@ async def handle_polymarket(request: Request) -> JSONResponse:
                     seen.add(slug)
                     candidates.append(parsed)
 
+        log.info("[polymarket] candidates after filtering: %d", len(candidates))
         # Sort by volume descending
         candidates.sort(key=lambda x: -x["volume"])
         result = {"markets": candidates[:6], "fetched_at": now_ts}
@@ -1012,7 +1022,7 @@ async def handle_polymarket(request: Request) -> JSONResponse:
         return JSONResponse(result, headers=_CORS)
 
     except Exception as e:
-        log.exception("polymarket fetch failed")
+        log.exception("[polymarket] gather failed: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
 
 
@@ -1041,26 +1051,34 @@ async def handle_manifold(request: Request) -> JSONResponse:
 
     async def fetch_term(term: str) -> list:
         try:
+            log.info("[manifold] fetching term=%r", term)
             r = await _http.get(
                 "https://api.manifold.markets/v0/search-markets",
                 params={"term": term, "limit": 5, "filter": "open", "sort": "liquidity"},
                 timeout=8,
             )
+            log.info("[manifold] term=%r status=%s body_len=%s", term, r.status_code, len(r.content))
             if r.status_code != 200:
+                log.warning("[manifold] non-200 for term=%r: %s", term, r.text[:500])
                 return []
-            return [
-                m for m in r.json()
+            data = r.json()
+            filtered = [
+                m for m in data
                 if isinstance(m, dict)
                 and m.get("outcomeType") == "BINARY"
                 and not m.get("isResolved")
                 and m.get("probability") is not None
                 and m.get("volume", 0) > 500
             ]
-        except Exception:
+            log.info("[manifold] term=%r raw=%d filtered=%d", term, len(data), len(filtered))
+            return filtered
+        except Exception as exc:
+            log.exception("[manifold] fetch failed for term=%r: %s", term, exc)
             return []
 
     try:
         pages = await asyncio.gather(*[fetch_term(t) for t in TERMS])
+        log.info("[manifold] pages fetched: %s", [len(p) for p in pages])
         seen: set = set()
         markets = []
         for page in pages:
@@ -1084,6 +1102,7 @@ async def handle_manifold(request: Request) -> JSONResponse:
                     "bettors":     m.get("uniqueBettorCount", 0),
                 })
 
+        log.info("[manifold] total unique markets: %d", len(markets))
         markets.sort(key=lambda x: -x["liquidity"])
         result = {"markets": markets[:6], "fetched_at": now_ts}
         _manifold_cache["data"] = result
@@ -1091,7 +1110,7 @@ async def handle_manifold(request: Request) -> JSONResponse:
         return JSONResponse(result, headers=_CORS)
 
     except Exception as e:
-        log.exception("manifold fetch failed")
+        log.exception("[manifold] gather failed: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
 
 
