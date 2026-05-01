@@ -960,12 +960,12 @@ async def handle_polymarket(request: Request) -> JSONResponse:
             return []
 
     def parse_event(event: dict) -> dict | None:
-        title = (event.get("title") or "").lower()
         event_slug = event.get("slug", "")
         if not event_slug:
             return None
 
-        # Find first open market with real price data
+        # Collect all open markets with valid probabilities
+        candidates: list = []
         for m in event.get("markets", []):
             if m.get("closed"):
                 continue
@@ -977,19 +977,26 @@ async def handle_polymarket(request: Request) -> JSONResponse:
             except Exception:
                 continue
 
-            # Skip fully resolved markets (0% or 100%)
-            if yes_prob in (0, 100):
+            # Skip effectively resolved markets (<1% or >99%)
+            if yes_prob < 1 or yes_prob > 99:
                 continue
 
-            question = m.get("question") or event.get("title") or ""
-            return {
-                "question": question,
-                "yes_prob": yes_prob,
-                "volume":   round(float(event.get("volume") or 0)),
-                "end_date": (m.get("endDate") or "")[:10],
-                "url":      f"https://polymarket.com/event/{event_slug}",
-            }
-        return None
+            candidates.append((yes_prob, m))
+
+        if not candidates:
+            return None
+
+        # Pick the market closest to 50% (most interesting / uncertain)
+        _, best = min(candidates, key=lambda x: abs(x[0] - 50))
+        yes_prob = round(float(json.loads(best.get("outcomePrices", "[]"))[0]) * 100)
+
+        return {
+            "question": best.get("question") or event.get("title") or "",
+            "yes_prob": yes_prob,
+            "volume":   round(float(event.get("volume") or 0)),
+            "end_date": (best.get("endDate") or "")[:10],
+            "url":      f"https://polymarket.com/event/{event_slug}",
+        }
 
     try:
         # Fetch crypto-tagged events + high-volume events in parallel
