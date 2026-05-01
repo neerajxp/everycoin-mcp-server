@@ -281,6 +281,151 @@ Browser
 
 ---
 
+## External API Reference
+
+All third-party endpoints the system calls, grouped by provider.
+
+---
+
+### CoinGecko
+
+| Endpoint | Called From | Purpose |
+|---|---|---|
+| `GET https://api.coingecko.com/api/v3/simple/price` | `server.py /prices`, `mcp_tools.py`, `mlops/fetch.py`, `priceService.ts` | Live USD prices + 24h change for one or more coins |
+| `GET https://api.coingecko.com/api/v3/coins/bitcoin/market_chart` | `server.py /predict/btc-momentum` | BTC OHLCV history for momentum signal calculation |
+| `GET https://api.coingecko.com/api/v3/search/trending` | `server.py /predict/trending-chips` | Trending coins list used for dynamic agent prompt chips |
+
+**Auth:** Optional `x-cg-demo-api-key` header (set via `COINGECKO_API_KEY` env var). Free tier applies when key is absent.
+
+---
+
+### Anthropic (Claude)
+
+| Endpoint | Called From | Model | Purpose |
+|---|---|---|---|
+| `POST https://api.anthropic.com/v1/messages` | `graph.py` — router, market_analyst, defi_researcher, wallet_forensics, knowledge_expert | claude-haiku-4-5 | Lightweight agent nodes — routing, analysis, research |
+| `POST https://api.anthropic.com/v1/messages` | `graph.py` — strategist | claude-sonnet-4-6 | Final synthesis and personalized user response |
+| `POST https://api.anthropic.com/v1/messages` | `server.py /predict/market-narrative` | claude-haiku-4-5 | Generates the AI Market Brief narrative + signal feed |
+
+**Auth:** `ANTHROPIC_API_KEY` environment variable (required).
+
+---
+
+### OKX
+
+| Endpoint | Called From | Purpose |
+|---|---|---|
+| `GET https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP` | `server.py /predict/btc-momentum`, `/whale/signals` | BTC perpetual funding rate — indicates leverage bias (longs vs shorts) |
+| `GET https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP` | `server.py /whale/signals` | BTC perpetual open interest in USD — trend strength signal |
+| `GET https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader?instId=BTC-USDT-SWAP&period=1H` | `server.py /whale/signals` | Top trader long/short ratio — contrarian sentiment signal |
+
+**Auth:** None required (public endpoints).
+
+---
+
+### Mempool.space
+
+| Endpoint | Called From | Purpose |
+|---|---|---|
+| `GET https://mempool.space/api/v1/blocks/tip/height` | `server.py /whale/signals` | Latest Bitcoin block height |
+| `GET https://mempool.space/api/block-height/{height}` | `server.py /whale/signals` | Block hash for a given height |
+| `GET https://mempool.space/api/block/{hash}` | `server.py /whale/signals` | Block metadata (timestamp, tx count) |
+| `GET https://mempool.space/api/block/{hash}/txs/0` | `server.py /whale/signals` | Transactions in a block — parsed for whale-size BTC moves |
+
+**Auth:** None required (public API).
+
+---
+
+### Polymarket
+
+| Endpoint | Called From | Purpose |
+|---|---|---|
+| `GET https://gamma-api.polymarket.com/markets?active=true&closed=false&tag_slug=crypto` | `server.py /predict/polymarket` | Active crypto prediction markets with YES probability prices |
+| `GET https://gamma-api.polymarket.com/markets?active=true&closed=false&tag_slug=bitcoin` | `server.py /predict/polymarket` | Active Bitcoin-tagged markets as supplementary source |
+
+**Auth:** None required (public API). Market URLs constructed as `https://polymarket.com/event/{slug}`.
+
+---
+
+### Manifold Markets
+
+| Endpoint | Called From | Purpose |
+|---|---|---|
+| `GET https://api.manifold.markets/v0/search-markets?term={keyword}&filter=open&sort=liquidity&limit=10` | `server.py /predict/manifold` | Search for open community prediction markets by keyword (BTC, ETH, crypto, etc.) — called in parallel for multiple terms |
+
+**Auth:** None required (public API).
+
+---
+
+### Etherscan / BSCScan
+
+| Endpoint | Called From | Purpose |
+|---|---|---|
+| `GET https://api.etherscan.io/v2/api` | `next/src/constants/chains.ts`, `mcp_tools.py` | Ethereum wallet token balances, transaction history |
+| `GET https://api.bscscan.com/api` | `next/src/constants/chains.ts` | BSC wallet token balances (accepts same Etherscan API key) |
+| `GET https://api.etherscan.io/api` | `mcp_tools.py`, `mlops/fetch.py` | Token metadata, historical transactions for wallet forensics |
+
+**Auth:** `ETHERSCAN_API_KEY` environment variable (required for portfolio features).
+
+---
+
+### Solana RPC
+
+| Endpoint | Called From | Purpose |
+|---|---|---|
+| `POST https://api.mainnet-beta.solana.com` | `next/src/services/solanaService.ts` | SOL balance + SPL token accounts for a wallet address |
+
+**Auth:** None required (public RPC). Rate-limited — upgrade to a private RPC (Helius, QuickNode) for production scale.
+
+---
+
+### BSC (Binance Smart Chain) RPC
+
+| Endpoint | Called From | Purpose |
+|---|---|---|
+| `POST https://bsc-dataseed.binance.org/` | `next/src/services/bscService.ts` | BEP-20 token balances via `eth_call` JSON-RPC |
+
+**Auth:** None required (public RPC).
+
+---
+
+### DeFiLlama
+
+| Endpoint | Called From | Purpose |
+|---|---|---|
+| `GET https://api.llama.fi/protocol/{protocol}` | `mcp_tools.py get_defi_tvl`, `mlops/fetch.py` | Protocol TVL (Total Value Locked) used in DeFi analysis and agent tools |
+
+**Auth:** None required (public API).
+
+---
+
+### HuggingFace Hub
+
+| Endpoint | Called From | Purpose |
+|---|---|---|
+| `https://huggingface.co/{repo}` | `mlops/promote.py`, `mlops/serve.py` | Upload trained XGBoost model after retraining; download best model at server startup |
+
+**Auth:** `HUGGINGFACE_TOKEN` environment variable (required for MLOps pipeline).
+
+---
+
+## External API Cache TTL Summary
+
+| Provider | Endpoint | Server TTL | Notes |
+|---|---|---|---|
+| CoinGecko | `/prices` | 5 min | In-memory |
+| CoinGecko | BTC market chart | 30 min | Part of btc-momentum cache |
+| CoinGecko | Trending chips | 30 min | In-memory |
+| OKX | Funding rate | 30 min | Bundled in whale/momentum cache |
+| OKX | Open interest | 5 min | Part of whale signals cache |
+| OKX | Long/short ratio | 5 min | Part of whale signals cache |
+| Mempool.space | Block txs | 5 min | Part of whale signals cache |
+| Polymarket Gamma | Markets | 15 min | In-memory |
+| Manifold | Search markets | 1 hour | In-memory |
+| Anthropic | Market narrative | 30 min | Busted via `?t=` param |
+
+---
+
 ## Deployment
 
 ```
