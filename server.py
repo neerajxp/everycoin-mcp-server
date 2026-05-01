@@ -10,6 +10,7 @@ Start locally:  python server.py
 Railway:        auto-starts via Procfile
 """
 
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -943,11 +944,27 @@ async def handle_polymarket(request: Request) -> JSONResponse:
     if _polymarket_cache.get("ts") and (now_ts - _polymarket_cache["ts"]) < _POLYMARKET_TTL:
         return JSONResponse(_polymarket_cache["data"], headers=_CORS)
 
-    CRYPTO_KW = [
-        "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto",
-        "microstrategy", "coinbase", "ripple", "xrp", "defi", "blockchain",
-        "token", "altcoin", "stablecoin", "megaeth", "opensea",
+    import re as _re
+    # Short tickers use word boundaries to avoid false positives (e.g. "eth" in "Netherlands")
+    CRYPTO_KW_PLAIN = [
+        "bitcoin", "ethereum", "solana", "crypto", "blockchain", "defi",
+        "altcoin", "stablecoin", "microstrategy", "coinbase", "ripple",
+        "opensea", "megaeth", "binance", "cardano", "avalanche", "polkadot",
+        "chainlink", "uniswap", "arbitrum", "optimism", "polygon", "base chain",
+        "memecoin", "nft", "web3", "layer 2", "layer2", "airdrop", "dao",
+        "staking", "yield", "dex", "cex", "spot etf", "crypto etf",
     ]
+    CRYPTO_KW_WORD = _re.compile(
+        r"\b(btc|eth|sol|xrp|bnb|ada|dot|link|matic|avax|uni|arb|op|sei|sui)\b"
+    )
+
+    def _is_crypto(q: str) -> str | None:
+        """Return matched keyword if q is crypto-related, else None."""
+        for kw in CRYPTO_KW_PLAIN:
+            if kw in q:
+                return kw
+        m = CRYPTO_KW_WORD.search(q)
+        return m.group() if m else None
 
     async def fetch_markets(tag: str) -> list:
         url = f"https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&tag_slug={tag}"
@@ -977,7 +994,7 @@ async def handle_polymarket(request: Request) -> JSONResponse:
             log.info("[polymarket] skip %s — closed", mid)
             return None
         q = (m.get("question") or "").lower()
-        kw_match = next((kw for kw in CRYPTO_KW if kw in q), None)
+        kw_match = _is_crypto(q)
         if not kw_match:
             log.info("[polymarket] skip %s — no crypto kw in %r", mid, q[:80])
             return None
