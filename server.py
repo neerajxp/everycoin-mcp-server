@@ -930,8 +930,8 @@ _POLYMARKET_TTL = 15 * 60  # 15 min
 async def handle_polymarket(request: Request) -> JSONResponse:
     """
     GET /predict/polymarket
-    Fetches active crypto prediction markets from Polymarket gamma events API.
-    Uses event slug for working URLs and outcomePrices from open markets only.
+    Fetches active crypto prediction markets from Polymarket gamma /markets API.
+    Filters by crypto keywords, picks markets closest to 50% (most uncertain).
     """
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_CORS)
@@ -949,79 +949,64 @@ async def handle_polymarket(request: Request) -> JSONResponse:
         "token", "altcoin", "stablecoin", "megaeth", "opensea",
     ]
 
-    async def fetch_events(params: str) -> list:
+    async def fetch_markets(tag: str) -> list:
         try:
             r = await _http.get(
-                f"https://gamma-api.polymarket.com/events?active=true&closed=false&{params}",
+                f"https://gamma-api.polymarket.com/markets"
+                f"?active=true&closed=false&limit=100&tag_slug={tag}",
                 timeout=12,
             )
-            return r.json() if r.status_code == 200 else []
+            return r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
         except Exception:
             return []
 
-    def parse_event(event: dict) -> dict | None:
-        event_slug = event.get("slug", "")
-        if not event_slug:
+    def parse_market(m: dict) -> dict | None:
+        if not isinstance(m, dict):
             return None
-
-        # Collect all open markets with valid probabilities
-        candidates: list = []
-        for m in event.get("markets", []):
-            if m.get("closed"):
-                continue
-            try:
-                prices = json.loads(m.get("outcomePrices") or "[]")
-                if not prices:
-                    continue
-                yes_prob = round(float(prices[0]) * 100)
-            except Exception:
-                continue
-
-            # Skip effectively resolved markets (<1% or >99%)
-            if yes_prob < 1 or yes_prob > 99:
-                continue
-
-            candidates.append((yes_prob, m))
-
-        if not candidates:
+        if m.get("closed"):
             return None
-
-        # Pick the market closest to 50% (most interesting / uncertain)
-        _, best = min(candidates, key=lambda x: abs(x[0] - 50))
-        yes_prob = round(float(json.loads(best.get("outcomePrices", "[]"))[0]) * 100)
-
+        q = (m.get("question") or "").lower()
+        if not any(kw in q for kw in CRYPTO_KW):
+            return None
+        try:
+            prices = json.loads(m.get("outcomePrices") or "[]")
+            if not prices:
+                return None
+            yes_prob = round(float(prices[0]) * 100)
+        except Exception:
+            return None
+        # Skip effectively resolved (<1% or >99%)
+        if yes_prob < 1 or yes_prob > 99:
+            return None
+        slug = m.get("slug", "")
         return {
-            "question": best.get("question") or event.get("title") or "",
+            "question": m.get("question", ""),
             "yes_prob": yes_prob,
-            "volume":   round(float(event.get("volume") or 0)),
-            "end_date": (best.get("endDate") or "")[:10],
-            "url":      f"https://polymarket.com/event/{event_slug}",
+            "volume":   round(float(m.get("volume") or 0)),
+            "end_date": (m.get("endDate") or "")[:10],
+            "url":      f"https://polymarket.com/event/{slug}",
         }
 
     try:
-        # Fetch crypto-tagged events + high-volume events in parallel
         pages = await asyncio.gather(
-            fetch_events("tag_slug=crypto&limit=100&order=volume&ascending=false"),
-            fetch_events("limit=100&order=volume24hr&ascending=false"),
+            fetch_markets("crypto"),
+            fetch_markets("bitcoin"),
         )
         seen: set = set()
-        markets: list = []
+        candidates: list = []
         for page in pages:
-            for event in page:
-                title = (event.get("title") or "").lower()
-                slug  = event.get("slug", "")
+            for m in page:
+                slug = m.get("slug", "")
                 if slug in seen:
                     continue
-                # Only keep crypto-related events
-                if not any(kw in title for kw in CRYPTO_KW):
-                    continue
-                parsed = parse_event(event)
+                parsed = parse_market(m)
                 if parsed:
                     seen.add(slug)
-                    markets.append(parsed)
+                    candidates.append(parsed)
 
-        markets.sort(key=lambda x: -x["volume"])
-        result = {"markets": markets[:6], "fetched_at": now_ts}
+        # Sort by volume descending
+        candidates.sort(key=lambda x: -x["volume"])
+        result = {"markets": candidates[:6], "fetched_at": now_ts}
         _polymarket_cache["data"] = result
         _polymarket_cache["ts"]   = now_ts
         return JSONResponse(result, headers=_CORS)
