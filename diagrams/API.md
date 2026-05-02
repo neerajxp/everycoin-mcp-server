@@ -177,6 +177,117 @@ Knowledge Files (*.md)
 
 ---
 
+## External API Endpoint Reference
+
+All outbound HTTP calls made by `server.py`. Every endpoint requires an active internet connection from the Railway host.
+
+### CoinGecko — `api.coingecko.com`
+
+| Endpoint | Used in handler | Purpose |
+|---|---|---|
+| `GET /api/v3/simple/price` | `/prices`, `/predict/btc-momentum` | Live BTC/ETH/ADA/SOL/BNB spot price in USD |
+| `GET /api/v3/coins/bitcoin/market_chart` | `/predict/btc-momentum` | 30-day BTC OHLCV for momentum signals |
+| `GET /api/v3/search/trending` | `/predict/trending-chips` | Top 7 trending coins for chip prompts |
+
+- **Auth:** None (public free tier) — rate limit 30 req/min
+- **Docs:** `https://docs.coingecko.com/reference/introduction`
+
+---
+
+### OKX — `www.okx.com`
+
+| Endpoint | Used in handler | Purpose |
+|---|---|---|
+| `GET /api/v5/public/funding-rate?instId=BTC-USDT-SWAP` | `/predict/btc-momentum`, `/whale/signals` | BTC perpetual funding rate |
+| `GET /api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP` | `/whale/signals` | BTC open interest (notional USD) |
+| `GET /api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader?instId=BTC-USDT-SWAP&period=1H` | `/whale/signals` | Top-trader long/short ratio |
+
+- **Auth:** None (public endpoints)
+- **Docs:** `https://www.okx.com/docs-v5/en/`
+
+---
+
+### Mempool.space — `mempool.space`
+
+| Endpoint | Used in handler | Purpose |
+|---|---|---|
+| `GET /api/v1/blocks/tip/height` | `/predict/btc-journey` | Latest confirmed Bitcoin block height |
+| `GET /api/block-height/{height}` | `/predict/btc-journey` | Resolve block height → block hash |
+| `GET /api/block/{hash}` | `/predict/btc-journey` | Block metadata (timestamp, fee stats) |
+| `GET /api/block/{hash}/txs/0` | `/predict/btc-journey` | First page of transactions in block |
+
+- **Auth:** None (public)
+- **Docs:** `https://mempool.space/docs/api/rest`
+
+---
+
+### Polymarket Gamma — `gamma-api.polymarket.com`
+
+| Endpoint | Used in handler | Purpose |
+|---|---|---|
+| `GET /markets?active=true&closed=false&limit=100&tag_slug=crypto` | `/predict/polymarket` | Active crypto prediction markets |
+| `GET /markets?active=true&closed=false&limit=100&tag_slug=bitcoin` | `/predict/polymarket` | Active Bitcoin prediction markets |
+
+- **Auth:** None (public)
+- **Key fields:** `question`, `slug`, `outcomePrices` (JSON string `["0.52","0.48"]`), `volume`, `endDate`
+- **TTL cache:** 15 minutes
+- **Docs:** `https://docs.polymarket.com/`
+
+---
+
+### Manifold Markets — `api.manifold.markets`
+
+| Endpoint | Used in handler | Purpose |
+|---|---|---|
+| `GET /v0/search-markets?term={term}&filter=open&sort=liquidity&limit=5` | `/predict/manifold` | Binary prediction markets for BTC/ETH/SOL/crypto terms |
+
+- **Auth:** None (public)
+- **Terms queried:** `bitcoin`, `ethereum`, `BTC price`, `crypto market`, `solana`
+- **Filter applied:** `outcomeType=BINARY`, `isResolved=false`, `volume > 500`
+- **TTL cache:** 1 hour
+- **Docs:** `https://docs.manifold.markets/api`
+
+---
+
+### Anthropic — `api.anthropic.com` (via SDK)
+
+| Model | Used in handler | Purpose |
+|---|---|---|
+| `claude-haiku-4-5` | `/predict/market-narrative` | 80-word market narrative from live signals |
+| `claude-haiku-4-5` | `/api/chat` (router node) | Query classification in LangGraph pipeline |
+| `claude-sonnet-4-6` | `/api/chat` (analyst nodes) | Market analysis, DeFi research, deep reasoning |
+
+- **Auth:** `ANTHROPIC_API_KEY` env var (required)
+- **SDK:** `anthropic` Python package
+
+---
+
+### Internal (localhost self-call)
+
+| Endpoint | Used in handler | Purpose |
+|---|---|---|
+| `GET http://localhost:{port}/predict/btc-momentum` | `/predict/market-narrative` | Fetch live momentum signals for narrative prompt |
+| `GET http://localhost:{port}/whale/signals` | `/predict/market-narrative` | Fetch whale signals for narrative prompt |
+
+- These are loopback calls within the same Railway container. No external connectivity needed.
+
+---
+
+### Cache TTL Summary
+
+| Provider | Endpoint group | TTL |
+|---|---|---|
+| CoinGecko prices | `/prices` | 60 s |
+| CoinGecko BTC chart | `/predict/btc-momentum` | 5 min |
+| CoinGecko trending | `/predict/trending-chips` | 30 min |
+| OKX funding / OI | `/whale/signals` | 2 min |
+| Mempool.space | `/predict/btc-journey` | 10 min |
+| Polymarket gamma | `/predict/polymarket` | 15 min |
+| Manifold Markets | `/predict/manifold` | 1 hour |
+| Market narrative | `/predict/market-narrative` | 10 min |
+
+---
+
 ## Frontend Feature Map
 
 ### Signals Page (`/`)
