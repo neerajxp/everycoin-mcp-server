@@ -47,6 +47,128 @@ _CORS = {
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
 }
 
+# ── Shared caches — avoid duplicate external API calls ────────────────────────
+import time as _time_cache
+
+# CoinGecko simple/price cache — keyed by frozenset of coin IDs
+# Saves ~3 redundant CoinGecko calls per user session
+_prices_cache: dict = {}          # {frozenset(ids): {"data": {...}, "ts": float}}
+_PRICES_TTL = 5 * 60              # 5 minutes
+
+# CoinGecko BTC hourly chart — used by momentum + price-target
+_btc_chart_cache: dict = {}       # {"data": [...], "ts": float}
+_BTC_CHART_TTL = 30 * 60          # 30 minutes (matches momentum TTL)
+
+# OKX futures data — funding rate, OI, L/S ratio
+# Shared between /whale/signals and /predict/btc-momentum
+_okx_cache: dict = {}             # {"data": {...}, "ts": float}
+_OKX_TTL = 5 * 60                 # 5 minutes
+
+# mempool.space whale transactions
+_whale_txns_cache: dict = {}      # {"data": [...], "netflow": str, "ts": float}
+_WHALE_TXNS_TTL = 3 * 60          # 3 minutes — new blocks every ~10 min, no need to hammer
+
+
+async def _get_prices(coin_ids: list[str], force: bool = False) -> dict:
+    """Cached CoinGecko simple/price fetch. Shared across all endpoints.
+    Pass force=True to bypass cache (e.g. on user-initiated hard refresh)."""
+    key = frozenset(coin_ids)
+    now = _time_cache.time()
+    cached = _prices_cache.get(key)
+    if not force and cached and (now - cached["ts"]) < _PRICES_TTL:
+        return cached["data"]
+
+    try:
+        res = await _http.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": ",".join(coin_ids), "vs_currencies": "usd", "include_24hr_change": "true"},
+            timeout=10,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            _prices_cache[key] = {"data": data, "ts": now}
+            return data
+    except Exception:
+        log.warning("_get_prices failed for %s", coin_ids)
+    return cached["data"] if cached else {}
+
+
+async def _get_btc_chart() -> list[float]:
+    """Cached CoinGecko hourly BTC price chart (48h). Shared across endpoints."""
+    now = _time_cache.time()
+    if _btc_chart_cache.get("ts") and (now - _btc_chart_cache["ts"]) < _BTC_CHART_TTL:
+        return _btc_chart_cache["data"]
+
+    try:
+        res = await _http.get(
+            "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+            "?vs_currency=usd&days=2&interval=hourly",
+            timeout=10,
+        )
+        if res.status_code == 200:
+            pts = res.json().get("prices", [])
+            prices = [p[1] for p in pts]
+            if prices:
+                _btc_chart_cache["data"] = prices
+                _btc_chart_cache["ts"] = now
+                return prices
+    except Exception:
+        log.warning("_get_btc_chart failed")
+    return _btc_chart_cache.get("data", [])
+
+
+async def _get_okx_futures() -> dict:
+    """Cached OKX futures data. Shared between /whale/signals and /predict/btc-momentum."""
+    import asyncio
+    now = _time_cache.time()
+    if _okx_cache.get("ts") and (now - _okx_cache["ts"]) < _OKX_TTL:
+        return _okx_cache["data"]
+
+    try:
+        funding_r, oi_r, lsr_r = await asyncio.gather(
+            _http.get("https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP", timeout=6),
+            _http.get("https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP", timeout=6),
+            _http.get("https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader?instId=BTC-USDT-SWAP&period=1H", timeout=6),
+            return_exceptions=True,
+        )
+
+        funding_rate = None
+        if not isinstance(funding_r, Exception) and funding_r.status_code == 200:
+            d = funding_r.json().get("data", [])
+            if d:
+                funding_rate = round(float(d[0]["fundingRate"]) * 100, 4)
+
+        open_interest_usd = None
+        oi_trend = None
+        if not isinstance(oi_r, Exception) and oi_r.status_code == 200:
+            d = oi_r.json().get("data", [])
+            if d:
+                open_interest_usd = float(d[0]["oiUsd"])
+
+        long_short_ratio = None
+        if not isinstance(lsr_r, Exception) and lsr_r.status_code == 200:
+            rows = lsr_r.json().get("data", [])
+            if len(rows) >= 2:
+                curr = float(rows[0][1])
+                prev = float(rows[1][1])
+                long_short_ratio = round(curr, 3)
+                oi_trend = "up" if curr > prev else "down"
+            elif len(rows) == 1:
+                long_short_ratio = round(float(rows[0][1]), 3)
+
+        result = {
+            "funding_rate":      funding_rate,
+            "open_interest_usd": open_interest_usd,
+            "long_short_ratio":  long_short_ratio,
+            "oi_trend":          oi_trend,
+        }
+        _okx_cache["data"] = result
+        _okx_cache["ts"] = now
+        return result
+    except Exception:
+        log.warning("_get_okx_futures failed")
+        return _okx_cache.get("data", {})
+
 
 # ── /api/chat ─────────────────────────────────────────────────────────────────
 
@@ -149,6 +271,11 @@ async def handle_mcp(request: Request) -> JSONResponse:
 
 # ── /prices ──────────────────────────────────────────────────────────────────
 
+def _is_hard_refresh(request: Request) -> bool:
+    """True when the browser signals Cache-Control: no-cache (hard refresh)."""
+    return request.headers.get("cache-control", "").lower() == "no-cache"
+
+
 async def handle_prices(request: Request) -> JSONResponse:
     """
     GET /prices?ids=bitcoin,ethereum,solana
@@ -161,25 +288,9 @@ async def handle_prices(request: Request) -> JSONResponse:
     if not ids:
         return JSONResponse({"error": "ids param required"}, status_code=400, headers=_CORS)
     try:
-        import httpx
         coin_ids = [cid.strip() for cid in ids.split(",") if cid.strip()]
-        # Single batched request — avoids 4 separate CoinGecko calls that each
-        # count against the free-tier rate limit (causing 429s on rapid refreshes).
-        async with httpx.AsyncClient() as client:
-            res = await client.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={
-                    "ids": ",".join(coin_ids),
-                    "vs_currencies": "usd",
-                    "include_24hr_change": "true",
-                },
-                timeout=10,
-            )
-        log.info("CoinGecko batch → status=%s ids=%s", res.status_code, coin_ids)
-        if res.status_code != 200:
-            log.warning("CoinGecko batch error: %s", res.text[:300])
-            return JSONResponse({}, headers=_CORS)
-        data = res.json()
+        # Bypass cache on hard refresh so the user always sees fresh prices
+        data = await _get_prices(coin_ids, force=_is_hard_refresh(request))
         results = {}
         for coin_id in coin_ids:
             row = data.get(coin_id)
@@ -188,7 +299,7 @@ async def handle_prices(request: Request) -> JSONResponse:
                     "price_usd": row.get("usd"),
                     "change_24h_pct": round(row.get("usd_24h_change", 0), 2),
                 }
-        log.info("handle_prices returning %d coins: %s", len(results), list(results.keys()))
+        log.info("handle_prices returning %d coins (cached=%s)", len(results), bool(data))
         return JSONResponse(results, headers=_CORS)
     except Exception as e:
         log.exception("Prices fetch failed")
@@ -284,17 +395,9 @@ async def handle_price_target(request: Request) -> JSONResponse:
         predicted_move_pct = max(-15.0, min(15.0, predicted_move_pct))
         predicted_move_pct = round(predicted_move_pct, 2)
 
-        # Fetch current BTC price
-        async with httpx.AsyncClient() as client:
-            res = await client.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": coin_id, "vs_currencies": "usd"},
-                timeout=8,
-            )
-        if res.status_code != 200:
-            return JSONResponse({"error": "Price fetch failed"}, status_code=503, headers=_CORS)
-
-        current_price = res.json().get(coin_id, {}).get("usd")
+        # Fetch current price via shared cache
+        price_data = await _get_prices([coin_id])
+        current_price = price_data.get(coin_id, {}).get("usd")
         if not current_price:
             return JSONResponse({"error": "Price unavailable"}, status_code=503, headers=_CORS)
 
@@ -498,35 +601,22 @@ async def handle_btc_momentum(request: Request) -> JSONResponse:
 
     now_ts = _time.time()
 
-    # Serve from cache if still fresh
-    if _momentum_cache.get("ts") and (now_ts - _momentum_cache["ts"]) < _MOMENTUM_TTL:
+    # Serve from cache if still fresh (skip on hard refresh)
+    if not _is_hard_refresh(request) and _momentum_cache.get("ts") and (now_ts - _momentum_cache["ts"]) < _MOMENTUM_TTL:
         data = dict(_momentum_cache["data"])
         data["cached"] = True
         return JSONResponse(data, headers=_CORS)
 
     try:
-        # ── 1. Fetch hourly BTC prices from CoinGecko (last 48h gives ~48 candles) ──
-        cg_r, okx_r = await asyncio.gather(
-            _http.get(
-                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-                "?vs_currency=usd&days=2&interval=hourly",
-                timeout=10,
-            ),
-            _http.get(
-                "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP",
-                timeout=6,
-            ),
-            return_exceptions=True,
+        # ── 1. Fetch BTC prices + OKX data — both use shared caches ──────────────
+        prices_raw, okx_data = await asyncio.gather(
+            _get_btc_chart(),
+            _get_okx_futures(),
         )
 
-        prices_raw: list[float] = []
         current_price: float = 0.0
-
-        if not isinstance(cg_r, Exception) and cg_r.status_code == 200:
-            pts = cg_r.json().get("prices", [])           # [[ts_ms, price], ...]
-            prices_raw = [p[1] for p in pts]
-            if prices_raw:
-                current_price = prices_raw[-1]
+        if prices_raw:
+            current_price = prices_raw[-1]
 
         if not prices_raw or current_price == 0:
             return JSONResponse({"error": "Unable to fetch price data"}, status_code=503, headers=_CORS)
@@ -540,24 +630,13 @@ async def handle_btc_momentum(request: Request) -> JSONResponse:
         ret_4h  = ((prices_raw[-1] / prices_raw[-5])  - 1) * 100 if len(prices_raw) >= 5  else 0.0
         ret_24h = ((prices_raw[-1] / prices_raw[-25]) - 1) * 100 if len(prices_raw) >= 25 else 0.0
 
-        # Funding rate from OKX
-        funding_rate: float | None = None
-        if not isinstance(okx_r, Exception) and okx_r.status_code == 200:
-            data_f = okx_r.json().get("data", [])
-            if data_f:
-                funding_rate = round(float(data_f[0]["fundingRate"]) * 100, 4)
+        # Funding rate from shared OKX cache
+        funding_rate: float | None = okx_data.get("funding_rate")
 
-        # Whale netflow (from cached whale signals if available — non-blocking)
+        # Whale netflow — use in-process cache to avoid HTTP self-call
         whale_flow = "neutral"
-        try:
-            wh_r = await asyncio.wait_for(
-                _http.get("https://web-production-54968.up.railway.app/whale/signals", timeout=4),
-                timeout=5,
-            )
-            if wh_r.status_code == 200:
-                whale_flow = wh_r.json().get("netflow_signal", "neutral")
-        except Exception:
-            pass  # best-effort; don't fail momentum if whale call is slow
+        if _whale_txns_cache.get("ts") and (_time_cache.time() - _whale_txns_cache["ts"]) < _WHALE_TXNS_TTL:
+            whale_flow = _whale_txns_cache.get("netflow", "neutral")
 
         # ── 3. Live score (0–100) ──────────────────────────────────────────────
         # Each signal contributes to a raw score, then normalise to 0–100.
@@ -738,6 +817,13 @@ async def handle_whale_signals(request: Request) -> JSONResponse:
     import asyncio
     import time
 
+    # Serve from cache if fresh (skip on hard refresh)
+    now_ts = time.time()
+    if not _is_hard_refresh(request) and _whale_txns_cache.get("ts") and (now_ts - _whale_txns_cache["ts"]) < _WHALE_TXNS_TTL:
+        cached = dict(_whale_txns_cache.get("response", {}))
+        cached["cached"] = True
+        return JSONResponse(cached, headers=_CORS)
+
     # Known BTC exchange hot wallet addresses (publicly documented)
     EXCHANGE_WALLETS: dict[str, str] = {
         "3LYJfcfHPXYJreMsASk2jkn69LWEYKzexb": "Binance",
@@ -759,20 +845,14 @@ async def handle_whale_signals(request: Request) -> JSONResponse:
     async def fetch_whale_txns():
         try:
             # Fetch recent confirmed transactions from mempool.space
-            # /api/v1/transactions gives recent mempool txs; we use block txs for confirmed
             blocks_r = await _http.get("https://mempool.space/api/v1/blocks/tip/height", timeout=6)
             if blocks_r.status_code != 200:
                 return []
             tip = int(blocks_r.text.strip())
 
-            # Get current BTC price for USD value calculation
-            price_r = await _http.get(
-                "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
-                timeout=6,
-            )
-            btc_price = 80000.0
-            if price_r.status_code == 200:
-                btc_price = price_r.json().get("bitcoin", {}).get("usd", 80000)
+            # BTC price from shared cache — avoids extra CoinGecko call
+            price_data = await _get_prices(["bitcoin"])
+            btc_price = price_data.get("bitcoin", {}).get("usd", 80000) or 80000
 
             whale_txns = []
 
@@ -857,51 +937,8 @@ async def handle_whale_signals(request: Request) -> JSONResponse:
             log.exception("fetch_whale_txns failed")
             return []
 
-    async def fetch_okx_futures():
-        # OKX public endpoints — no key, no US geo-block
-        try:
-            funding_r, oi_r, lsr_r = await asyncio.gather(
-                _http.get("https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP", timeout=6),
-                _http.get("https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP", timeout=6),
-                _http.get("https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader?instId=BTC-USDT-SWAP&period=1H", timeout=6),
-                return_exceptions=True,
-            )
-
-            funding_rate = None
-            if not isinstance(funding_r, Exception) and funding_r.status_code == 200:
-                data = funding_r.json().get("data", [])
-                if data:
-                    funding_rate = round(float(data[0]["fundingRate"]) * 100, 4)  # as %
-
-            open_interest_usd = None
-            oi_trend = None
-            if not isinstance(oi_r, Exception) and oi_r.status_code == 200:
-                data = oi_r.json().get("data", [])
-                if data:
-                    open_interest_usd = float(data[0]["oiUsd"])
-
-            long_short_ratio = None
-            if not isinstance(lsr_r, Exception) and lsr_r.status_code == 200:
-                rows = lsr_r.json().get("data", [])
-                if len(rows) >= 2:
-                    curr = float(rows[0][1])
-                    prev = float(rows[1][1])
-                    long_short_ratio = round(curr, 3)
-                    oi_trend = "up" if curr > prev else "down"
-                elif len(rows) == 1:
-                    long_short_ratio = round(float(rows[0][1]), 3)
-
-            return {
-                "funding_rate":      funding_rate,
-                "open_interest_usd": open_interest_usd,
-                "long_short_ratio":  long_short_ratio,
-                "oi_trend":          oi_trend,
-            }
-        except Exception:
-            log.exception("fetch_okx_futures failed")
-            return {}
-
-    txns, futures = await asyncio.gather(fetch_whale_txns(), fetch_okx_futures())
+    # Use shared OKX cache — no duplicate fetch
+    txns, futures = await asyncio.gather(fetch_whale_txns(), _get_okx_futures())
 
     # Netflow signal derived from transaction directions
     sells = sum(1 for t in txns if t["signal"] == "sell")
@@ -913,13 +950,20 @@ async def handle_whale_signals(request: Request) -> JSONResponse:
     else:
         netflow_signal = "neutral"
 
-    return JSONResponse({
+    response = {
         "transactions":   txns,
         "netflow_signal": netflow_signal,
         "netflow_sells":  sells,
         "netflow_buys":   buys,
         "futures":        futures,
-    }, headers=_CORS)
+        "cached":         False,
+    }
+    # Store in shared cache so /predict/btc-momentum can read netflow without an HTTP call
+    _whale_txns_cache["response"] = response
+    _whale_txns_cache["netflow"]  = netflow_signal
+    _whale_txns_cache["ts"]       = now_ts
+
+    return JSONResponse(response, headers=_CORS)
 
 
 # ── /predict/polymarket ──────────────────────────────────────────────────────
@@ -1141,6 +1185,106 @@ async def handle_manifold(request: Request) -> JSONResponse:
 
     except Exception as e:
         log.exception("[manifold] gather failed: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
+
+
+# ── /predict/metaculus ───────────────────────────────────────────────────────
+
+_metaculus_cache: dict = {}
+_METACULUS_TTL = 60 * 60  # 1 hour
+
+
+async def handle_metaculus(request: Request) -> JSONResponse:
+    """
+    GET /predict/metaculus
+    Fetches open crypto forecasting questions from Metaculus (public API, no auth).
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS)
+
+    import time as _time
+    import asyncio
+
+    now_ts = _time.time()
+    if _metaculus_cache.get("ts") and (now_ts - _metaculus_cache["ts"]) < _METACULUS_TTL:
+        return JSONResponse(_metaculus_cache["data"], headers=_CORS)
+
+    SEARCH_TERMS = ["bitcoin", "ethereum", "crypto", "solana", "BTC"]
+
+    async def fetch_term(term: str) -> list:
+        try:
+            log.info("[metaculus] fetching term=%r", term)
+            r = await _http.get(
+                "https://www.metaculus.com/api2/questions/",
+                params={
+                    "search":   term,
+                    "status":   "open",
+                    "type":     "forecast",
+                    "limit":    5,
+                    "order_by": "-activity",
+                },
+                timeout=10,
+                headers={"Accept": "application/json"},
+            )
+            log.info("[metaculus] term=%r status=%s", term, r.status_code)
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            return data.get("results", [])
+        except Exception as exc:
+            log.exception("[metaculus] fetch failed for term=%r: %s", term, exc)
+            return []
+
+    try:
+        pages = await asyncio.gather(*[fetch_term(t) for t in SEARCH_TERMS])
+        log.info("[metaculus] pages fetched: %s", [len(p) for p in pages])
+
+        seen: set = set()
+        markets = []
+        for page in pages:
+            for q in page:
+                qid = q.get("id")
+                if qid in seen:
+                    continue
+                seen.add(qid)
+
+                # Extract community median probability
+                cp = q.get("community_prediction") or {}
+                full = cp.get("full") or {}
+                q2 = full.get("q2")  # median (0–1)
+                if q2 is None:
+                    continue
+                probability = round(q2 * 100)
+                if probability < 1 or probability > 99:
+                    continue
+
+                close_time = q.get("close_time", "")
+                close_date = ""
+                if close_time:
+                    try:
+                        from datetime import datetime, timezone
+                        dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                        close_date = dt.strftime("%Y-%m-%d")
+                    except Exception:
+                        pass
+
+                markets.append({
+                    "question":    q.get("title", ""),
+                    "probability": probability,
+                    "forecasters": q.get("number_of_forecasters", 0),
+                    "close_date":  close_date,
+                    "url":         f"https://www.metaculus.com/questions/{qid}/",
+                })
+
+        log.info("[metaculus] total unique questions: %d", len(markets))
+        markets.sort(key=lambda x: -x["forecasters"])
+        result = {"markets": markets[:6], "fetched_at": now_ts}
+        _metaculus_cache["data"] = result
+        _metaculus_cache["ts"]   = now_ts
+        return JSONResponse(result, headers=_CORS)
+
+    except Exception as e:
+        log.exception("[metaculus] gather failed: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
 
 
@@ -1417,6 +1561,92 @@ Write your 2-3 sentence market brief now:"""
         return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS)
 
 
+# ── Blog comments — SQLite storage ───────────────────────────────────────────
+
+import sqlite3
+import re
+import time as _time_mod
+
+_COMMENTS_DB = os.path.join(os.path.dirname(__file__), "data", "comments.db")
+
+
+def _comments_conn() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(_COMMENTS_DB), exist_ok=True)
+    conn = sqlite3.connect(_COMMENTS_DB, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS comments (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug      TEXT NOT NULL,
+            name      TEXT NOT NULL,
+            text      TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_comments_slug ON comments(slug)")
+    conn.commit()
+    return conn
+
+
+_comments_db: sqlite3.Connection | None = None
+
+
+def _get_comments_db() -> sqlite3.Connection:
+    global _comments_db
+    if _comments_db is None:
+        _comments_db = _comments_conn()
+    return _comments_db
+
+
+async def handle_blog_comments(request: Request) -> JSONResponse:
+    """
+    GET  /blog/comments?slug=<post-slug>  — list approved comments
+    POST /blog/comments                   — submit a new comment
+         body: { slug, name, text }
+    OPTIONS /blog/comments                — CORS preflight
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS)
+
+    db = _get_comments_db()
+
+    if request.method == "GET":
+        slug = request.query_params.get("slug", "").strip()
+        if not slug:
+            return JSONResponse({"error": "slug param required"}, status_code=400, headers=_CORS)
+        rows = db.execute(
+            "SELECT id, name, text, created_at FROM comments WHERE slug = ? ORDER BY created_at ASC",
+            (slug,),
+        ).fetchall()
+        comments = [{"id": r["id"], "name": r["name"], "text": r["text"], "created_at": r["created_at"]} for r in rows]
+        return JSONResponse({"comments": comments}, headers=_CORS)
+
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400, headers=_CORS)
+
+        slug = (body.get("slug") or "").strip()
+        name = (body.get("name") or "").strip()[:80]
+        text = (body.get("text") or "").strip()[:2000]
+
+        if not slug or not name or not text:
+            return JSONResponse({"error": "slug, name, and text are required"}, status_code=400, headers=_CORS)
+        if not re.match(r'^[a-z0-9\-]+$', slug):
+            return JSONResponse({"error": "Invalid slug"}, status_code=400, headers=_CORS)
+
+        created_at = int(_time_mod.time())
+        cur = db.execute(
+            "INSERT INTO comments (slug, name, text, created_at) VALUES (?, ?, ?, ?)",
+            (slug, name, text, created_at),
+        )
+        db.commit()
+        return JSONResponse({"id": cur.lastrowid, "name": name, "text": text, "created_at": created_at}, headers=_CORS)
+
+    return JSONResponse({"error": "Method not allowed"}, status_code=405, headers=_CORS)
+
+
 # ── /health ───────────────────────────────────────────────────────────────────
 
 async def handle_health(_request: Request) -> JSONResponse:
@@ -1470,8 +1700,10 @@ starlette_app = Starlette(
         Route("/whale/signals", handle_whale_signals, methods=["GET", "OPTIONS"]),
         Route("/predict/polymarket",        handle_polymarket,        methods=["GET", "OPTIONS"]),
         Route("/predict/manifold",          handle_manifold,          methods=["GET", "OPTIONS"]),
+        Route("/predict/metaculus",         handle_metaculus,         methods=["GET", "OPTIONS"]),
         Route("/predict/trending-chips",    handle_trending_chips,    methods=["GET", "OPTIONS"]),
         Route("/predict/market-narrative", handle_market_narrative, methods=["GET", "OPTIONS"]),
+        Route("/blog/comments", handle_blog_comments, methods=["GET", "POST", "OPTIONS"]),
         Route("/health", handle_health, methods=["GET"]),
     ],
 )
