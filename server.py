@@ -1291,13 +1291,16 @@ async def handle_metaculus(request: Request) -> JSONResponse:
 # ── /predict/trending-chips ──────────────────────────────────────────────────
 
 _chips_cache: dict = {}
-_CHIPS_TTL = 1800  # 30 min
+_CHIPS_TTL = 5 * 60  # 5 min
 
 async def handle_trending_chips(request: Request) -> JSONResponse:
     """
     GET /predict/trending-chips
-    Returns 8 hot chip prompts derived from CoinGecko trending coins +
-    top Polymarket question + a few evergreen topics.
+    Returns 8 hot chip prompts built from live crypto news and trending data:
+      1. CryptoCompare latest news headlines  (free, no key)
+      2. Reddit r/CryptoCurrency hot posts    (free, no key)
+      3. CoinGecko trending coins             (free, no key)
+      4. Evergreen fallbacks to pad to 8
     """
     import time
     now_ts = time.time()
@@ -1306,43 +1309,80 @@ async def handle_trending_chips(request: Request) -> JSONResponse:
         return JSONResponse(_chips_cache["data"], headers=_CORS)
 
     chips: list[str] = []
+    sources_used: list[str] = []
 
+    def _trim(text: str, limit: int = 52) -> str:
+        text = text.strip()
+        return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+    # ── 1. CryptoCompare news — top popular headlines ─────────────────────────
     try:
-        # 1. CoinGecko trending — top 7 coins
+        r = await _http.get(
+            "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=popular",
+            timeout=8,
+        )
+        r.raise_for_status()
+        articles = r.json().get("Data", [])[:5]
+        for article in articles:
+            title = article.get("title", "").strip()
+            if title and len(chips) < 4:
+                chips.append(_trim(title))
+        if chips:
+            sources_used.append("cryptocompare")
+            log.info("trending-chips: %d chips from CryptoCompare", len(chips))
+    except Exception as e:
+        log.warning("trending-chips: CryptoCompare failed — %s", e)
+
+    # ── 2. Reddit r/CryptoCurrency hot posts ─────────────────────────────────
+    try:
+        r = await _http.get(
+            "https://www.reddit.com/r/CryptoCurrency/hot.json?limit=10",
+            headers={"User-Agent": "EveryCoin/1.0 (crypto research tool)"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        posts = r.json().get("data", {}).get("children", [])
+        for post in posts:
+            data = post.get("data", {})
+            # skip pinned/mod posts and very low-engagement posts
+            if data.get("stickied") or data.get("score", 0) < 50:
+                continue
+            title = data.get("title", "").strip()
+            if title and len(chips) < 6:
+                chips.append(_trim(title))
+        if "cryptocompare" not in sources_used or len(chips) > 4:
+            sources_used.append("reddit")
+            log.info("trending-chips: reddit added, total %d chips", len(chips))
+    except Exception as e:
+        log.warning("trending-chips: Reddit failed — %s", e)
+
+    # ── 3. CoinGecko trending coins — fill remaining slots ───────────────────
+    try:
         r = await _http.get(
             "https://api.coingecko.com/api/v3/search/trending",
             timeout=6,
         )
-        trending = r.json().get("coins", [])[:6]
+        r.raise_for_status()
+        trending = r.json().get("coins", [])
         templates = [
             "Is {name} a buy right now?",
             "What's driving {name} today?",
             "{symbol} price prediction",
             "Should I hold {name}?",
-            "{name} technical analysis",
-            "Risks of investing in {name}",
         ]
         for i, coin in enumerate(trending):
+            if len(chips) >= 7:
+                break
             item = coin.get("item", {})
             name   = item.get("name", "")
             symbol = item.get("symbol", "")
             if name:
                 chips.append(templates[i % len(templates)].format(name=name, symbol=symbol))
-    except Exception:
-        log.warning("trending-chips: CoinGecko fetch failed")
+        sources_used.append("coingecko")
+    except Exception as e:
+        log.warning("trending-chips: CoinGecko failed — %s", e)
 
-    # 2. Top Polymarket question as a chip
-    try:
-        if _polymarket_cache.get("data"):
-            markets = _polymarket_cache["data"].get("markets", [])
-            if markets:
-                q = markets[0]["question"]
-                # trim to ~40 chars for chip display
-                chips.append(q if len(q) <= 42 else q[:40].rstrip() + "…")
-    except Exception:
-        pass
-
-    # 3. Evergreen fallbacks — pad to 8
+    # ── 4. Evergreen fallbacks — pad to 8 ────────────────────────────────────
     evergreen = [
         "DeFi market outlook",
         "Best L2s right now",
@@ -1358,10 +1398,14 @@ async def handle_trending_chips(request: Request) -> JSONResponse:
             break
         if e not in chips:
             chips.append(e)
+    if not sources_used:
+        sources_used.append("evergreen")
 
-    result = {"chips": chips[:8]}
+    source = "+".join(sources_used)
+    result = {"chips": chips[:8], "source": source}
     _chips_cache["data"] = result
     _chips_cache["ts"]   = now_ts
+    log.info("trending-chips: returning %d chips (source=%s)", len(chips), source)
     return JSONResponse(result, headers=_CORS)
 
 
